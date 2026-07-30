@@ -1,0 +1,1177 @@
+import express from 'express';
+import helmet from 'helmet';
+import morgan from 'morgan';
+import path from 'node:path';
+import fs from 'node:fs';
+import crypto from 'node:crypto';
+import { fileURLToPath } from 'node:url';
+import archiver from 'archiver';
+import { Readable } from 'node:stream';
+import { pipeline } from 'node:stream/promises';
+import { execFile, spawn } from 'node:child_process';
+import { promisify } from 'node:util';
+import { parseMedia, listSupportedPlatforms, extractFirstUrl, detectPlatform } from './parsers/index.js';
+import { assertPublicUrl, getCookieStatus, resolveRedirects, getCookieHeader, assertCookieForDownload, getDownloadCookieRequirementStatus, requiresCookieForDownload, getProxyStatus, validateProxyUrl, proxyConfigPath, getProxyArgs, normalizeParsePreferences } from './parsers/shared.js';
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+const execFileAsync = promisify(execFile);
+
+const app = express();
+const port = Number(process.env.PORT || 3000);
+
+const dataDir = process.env.DATA_DIR || path.join(__dirname, '..', 'data');
+const historyPath = path.join(dataDir, 'history.jsonl');
+const historyMaxLines = Number(process.env.HISTORY_MAX_LINES || 500);
+const packagePath = fs.existsSync(path.join(__dirname, 'package.json')) ? path.join(__dirname, 'package.json') : path.join(__dirname, '..', 'package.json');
+const staticDir = fs.existsSync(path.join(__dirname, '..', 'public')) ? path.join(__dirname, '..', 'public') : __dirname;
+const packageJson = JSON.parse(fs.readFileSync(packagePath, 'utf8'));
+const appVersion = packageJson.version || '0.0.0';
+
+const authUser = process.env.ONEPICK_AUTH_USER || 'hugh';
+const authPassword = process.env.ONEPICK_AUTH_PASSWORD || process.env.ONEPICK_ADMIN_PASSWORD || '';
+const authSecret = process.env.ONEPICK_AUTH_SECRET || authPassword || crypto.randomBytes(32).toString('hex');
+const authEnabled = Boolean(authPassword);
+const authCookieName = 'onepick_token';
+const authTokenTtlSeconds = Number(process.env.ONEPICK_TOKEN_TTL_SECONDS || 30 * 24 * 60 * 60);
+const authConfigPath = path.join(dataDir, 'auth.json');
+const staticApiTokens = String(process.env.ONEPICK_API_TOKEN || '')
+  .split(',')
+  .map(token => token.trim())
+  .filter(Boolean);
+
+function ensureDataDir() {
+  fs.mkdirSync(dataDir, { recursive: true });
+}
+
+function sanitizeHistoryUrl(value = '') {
+  const text = String(value || '');
+  try {
+    const url = new URL(text);
+    for (const key of [...url.searchParams.keys()]) {
+      if (/token|key|cookie|signature|sign|auth|credential/i.test(key)) url.searchParams.set(key, '***');
+    }
+    return url.toString().slice(0, 500);
+  } catch {
+    return text.slice(0, 500);
+  }
+}
+
+function appendHistory(entry) {
+  try {
+    ensureDataDir();
+    const safe = {
+      ts: new Date().toISOString(),
+      kind: entry.kind || 'parse',
+      ok: Boolean(entry.ok),
+      durationMs: entry.durationMs || 0,
+      platform: entry.platform || null,
+      parser: entry.parser || null,
+      title: entry.title || '',
+      sourceUrl: sanitizeHistoryUrl(entry.sourceUrl || entry.input || ''),
+      itemCount: entry.itemCount || 0,
+      error: entry.error ? String(entry.error).slice(0, 1000) : ''
+    };
+    fs.appendFileSync(historyPath, JSON.stringify(safe) + '\n');
+    trimHistory();
+  } catch (error) {
+    console.warn('Failed to append history:', error.message);
+  }
+}
+
+function collectRequestText(value, parts = [], depth = 0) {
+  if (value === null || value === undefined || depth > 5) return parts;
+  if (typeof value === 'string' || typeof value === 'number' || typeof value === 'boolean') {
+    parts.push(String(value));
+    return parts;
+  }
+  if (Array.isArray(value)) {
+    for (const item of value) collectRequestText(item, parts, depth + 1);
+    return parts;
+  }
+  if (typeof value === 'object') {
+    for (const item of Object.values(value)) collectRequestText(item, parts, depth + 1);
+  }
+  return parts;
+}
+
+function requestInputText(body = {}) {
+  const direct = body?.input ?? body?.url ?? body?.text ?? body?.content ?? body?.clipboard;
+  if (direct !== undefined && direct !== null && extractFirstUrl(direct)) return collectRequestText(direct).join('\n');
+  if (direct !== undefined && direct !== null && typeof direct !== 'object') return String(direct);
+  return collectRequestText(body).join('\n');
+}
+
+function shortcutRequestDebug(body = {}, input = '') {
+  const keys = body && typeof body === 'object' && !Array.isArray(body) ? Object.keys(body).filter(key => !/token|auth|password|secret/i.test(key)) : [];
+  const direct = body?.input ?? body?.url ?? body?.text ?? body?.content ?? body?.clipboard;
+  return {
+    bodyType: Array.isArray(body) ? 'array' : typeof body,
+    keys,
+    directType: Array.isArray(direct) ? 'array' : typeof direct,
+    inputLength: String(input || '').length,
+    inputPreview: String(input || '').replace(/https?:\/\/\S+/gi, '<url>').slice(0, 80),
+  };
+}
+
+function trimHistory() {
+  try {
+    if (!fs.existsSync(historyPath)) return;
+    const lines = fs.readFileSync(historyPath, 'utf8').trim().split('\n').filter(Boolean);
+    if (lines.length <= historyMaxLines) return;
+    fs.writeFileSync(historyPath, lines.slice(-historyMaxLines).join('\n') + '\n');
+  } catch (error) {
+    console.warn('Failed to trim history:', error.message);
+  }
+}
+
+function readHistory(limit = 50) {
+  try {
+    if (!fs.existsSync(historyPath)) return [];
+    const lines = fs.readFileSync(historyPath, 'utf8').trim().split('\n').filter(Boolean);
+    return lines.slice(-Math.min(Math.max(Number(limit) || 50, 1), 200)).reverse().map(line => {
+      try { return JSON.parse(line); } catch { return null; }
+    }).filter(Boolean);
+  } catch {
+    return [];
+  }
+}
+
+function clearHistory() {
+  ensureDataDir();
+  if (!fs.existsSync(historyPath)) return 0;
+  const lines = fs.readFileSync(historyPath, 'utf8').trim().split('\n').filter(Boolean);
+  fs.writeFileSync(historyPath, '');
+  return lines.length;
+}
+
+function hashPassword(password, salt = crypto.randomBytes(16).toString('base64url')) {
+  const hash = crypto.pbkdf2Sync(String(password || ''), salt, 210000, 32, 'sha256').toString('base64url');
+  return { algorithm: 'pbkdf2-sha256', iterations: 210000, salt, hash };
+}
+
+function readAuthConfig() {
+  try {
+    if (!fs.existsSync(authConfigPath)) return null;
+    return JSON.parse(fs.readFileSync(authConfigPath, 'utf8'));
+  } catch (error) {
+    console.warn('Failed to read auth config:', error.message);
+    return null;
+  }
+}
+
+function writeAuthConfig(config) {
+  ensureDataDir();
+  fs.writeFileSync(authConfigPath, JSON.stringify(config, null, 2) + '\n', { mode: 0o600 });
+}
+
+function currentAuthUser() {
+  return String(readAuthConfig()?.username || authUser);
+}
+
+function verifyPassword(password) {
+  const config = readAuthConfig();
+  if (config?.password?.hash && config?.password?.salt) {
+    const expected = Buffer.from(config.password.hash);
+    const actual = Buffer.from(hashPassword(password, config.password.salt).hash);
+    return expected.length === actual.length && crypto.timingSafeEqual(expected, actual);
+  }
+  const expectedPassword = Buffer.from(authPassword);
+  const actualPassword = Buffer.from(String(password || ''));
+  return expectedPassword.length === actualPassword.length && crypto.timingSafeEqual(expectedPassword, actualPassword);
+}
+
+function verifyCredentials(username, password) {
+  const expectedUser = Buffer.from(currentAuthUser());
+  const actualUser = Buffer.from(String(username || '').trim());
+  const userOk = expectedUser.length === actualUser.length && crypto.timingSafeEqual(expectedUser, actualUser);
+  return userOk && verifyPassword(password);
+}
+
+function base64url(input) {
+  return Buffer.from(input).toString('base64url');
+}
+
+function signTokenPayload(payload) {
+  return crypto.createHmac('sha256', authSecret).update(payload).digest('base64url');
+}
+
+function createAuthToken(subject = currentAuthUser()) {
+  const now = Math.floor(Date.now() / 1000);
+  const payload = base64url(JSON.stringify({ sub: subject, scope: 'onepick', iat: now, exp: now + authTokenTtlSeconds }));
+  return `${payload}.${signTokenPayload(payload)}`;
+}
+
+function verifyAuthToken(token = '') {
+  if (staticApiTokens.some(staticToken => {
+    const expectedBuffer = Buffer.from(staticToken);
+    const actualBuffer = Buffer.from(String(token || ''));
+    return expectedBuffer.length === actualBuffer.length && crypto.timingSafeEqual(expectedBuffer, actualBuffer);
+  })) {
+    return { sub: 'shortcut', scope: 'onepick-api', static: true };
+  }
+  const [payload, signature] = String(token || '').split('.');
+  if (!payload || !signature) return null;
+  const expected = signTokenPayload(payload);
+  const signatureBuffer = Buffer.from(signature);
+  const expectedBuffer = Buffer.from(expected);
+  if (signatureBuffer.length !== expectedBuffer.length || !crypto.timingSafeEqual(signatureBuffer, expectedBuffer)) return null;
+  let parsed = null;
+  try {
+    parsed = JSON.parse(Buffer.from(payload, 'base64url').toString('utf8'));
+  } catch {
+    return null;
+  }
+  const now = Math.floor(Date.now() / 1000);
+  if (parsed.scope !== 'onepick' || !parsed.exp || Number(parsed.exp) < now) return null;
+  return parsed;
+}
+
+function parseCookies(header = '') {
+  return Object.fromEntries(String(header || '').split(';').map(part => {
+    const index = part.indexOf('=');
+    if (index < 0) return null;
+    return [part.slice(0, index).trim(), decodeURIComponent(part.slice(index + 1).trim())];
+  }).filter(Boolean));
+}
+
+function extractAuthToken(req) {
+  const authorization = String(req.headers.authorization || '');
+  if (/^Bearer\s+/i.test(authorization)) return authorization.replace(/^Bearer\s+/i, '').trim();
+  if (req.headers['x-onepick-token']) return String(req.headers['x-onepick-token']).trim();
+  if (req.body?.token) return String(req.body.token).trim();
+  if (req.query?.token) return String(req.query.token).trim();
+  const cookies = parseCookies(req.headers.cookie || '');
+  return cookies[authCookieName] || '';
+}
+
+function requireAuth(req, res, next) {
+  if (!authEnabled) return next();
+  const token = extractAuthToken(req);
+  const session = verifyAuthToken(token);
+  if (session) {
+    req.onepickAuth = session;
+    return next();
+  }
+  if (req.path.startsWith('/api/')) {
+    res.status(401).json({ error: 'Unauthorized', authRequired: true, login: '/login' });
+    return;
+  }
+  res.redirect(`/login?next=${encodeURIComponent(req.originalUrl || '/')}`);
+}
+
+function authCookieOptions(req) {
+  const secure = req.secure || String(req.headers['x-forwarded-proto'] || '').includes('https');
+  return { httpOnly: true, sameSite: 'lax', secure, maxAge: authTokenTtlSeconds * 1000, path: '/' };
+}
+
+
+app.use(helmet({ contentSecurityPolicy: false }));
+app.use(morgan('tiny'));
+app.use(express.json({ limit: '1mb' }));
+app.use(express.urlencoded({ extended: true }));
+app.use(express.text({ type: 'text/plain', limit: '2mb' }));
+
+app.get('/login', (req, res) => {
+  if (!authEnabled) {
+    res.redirect('/');
+    return;
+  }
+  res.sendFile(path.join(staticDir, 'login.html'));
+});
+
+app.post('/api/auth/login', (req, res) => {
+  if (!authEnabled) {
+    res.json({ ok: true, authEnabled: false, token: '' });
+    return;
+  }
+  const username = String(req.body?.username || '').trim();
+  const password = String(req.body?.password || '');
+  if (!verifyCredentials(username, password)) {
+    res.status(401).json({ error: '用户名或密码不正确。' });
+    return;
+  }
+  const token = createAuthToken(username);
+  res.cookie(authCookieName, token, authCookieOptions(req));
+  res.json({ ok: true, authEnabled: true, user: username, token, expiresIn: authTokenTtlSeconds });
+});
+
+app.post('/api/auth/logout', (req, res) => {
+  res.clearCookie(authCookieName, { path: '/' });
+  res.json({ ok: true });
+});
+
+app.get('/api/auth/status', (req, res) => {
+  const session = authEnabled ? verifyAuthToken(extractAuthToken(req)) : { sub: 'local' };
+  res.json({ ok: true, authEnabled, authenticated: Boolean(session), user: session?.sub || null, username: currentAuthUser() });
+});
+
+app.get('/api/health', (req, res) => {
+  res.json({ ok: true, service: 'OnePick Tools', version: appVersion, authEnabled, time: new Date().toISOString() });
+});
+
+app.use(requireAuth);
+
+app.post('/api/auth/token', (req, res) => {
+  const subject = req.onepickAuth?.sub || authUser;
+  const token = createAuthToken(subject);
+  res.cookie(authCookieName, token, authCookieOptions(req));
+  res.json({ ok: true, token, expiresIn: authTokenTtlSeconds });
+});
+
+app.post('/api/auth/account', (req, res) => {
+  if (!authEnabled) {
+    res.json({ ok: true, authEnabled: false });
+    return;
+  }
+  const currentPassword = String(req.body?.currentPassword || '');
+  if (!verifyPassword(currentPassword)) {
+    res.status(401).json({ error: '当前密码不正确。' });
+    return;
+  }
+  const nextUsername = String(req.body?.username || currentAuthUser()).trim();
+  const nextPassword = String(req.body?.newPassword || '');
+  if (!nextUsername || nextUsername.length > 64) {
+    res.status(400).json({ error: '用户名不能为空，且不能超过 64 个字符。' });
+    return;
+  }
+  if (nextPassword.length < 8) {
+    res.status(400).json({ error: '新密码至少需要 8 位。' });
+    return;
+  }
+  const nextConfig = {
+    username: nextUsername,
+    password: hashPassword(nextPassword),
+    updatedAt: new Date().toISOString()
+  };
+  writeAuthConfig(nextConfig);
+  const token = createAuthToken(nextUsername);
+  res.cookie(authCookieName, token, authCookieOptions(req));
+  res.json({ ok: true, username: nextUsername, token, expiresIn: authTokenTtlSeconds });
+});
+
+app.use(express.static(staticDir, {
+  extensions: ['html'],
+  maxAge: process.env.NODE_ENV === 'production' ? '10m' : 0
+}));
+
+
+
+async function commandVersion(command, args = ['--version']) {
+  try {
+    const { stdout } = await execFileAsync(command, args, { timeout: 8000, maxBuffer: 512 * 1024 });
+    return stdout.split('\n')[0].trim();
+  } catch (error) {
+    return null;
+  }
+}
+
+
+
+const manageableCookiePlatforms = new Set(['douyin', 'xiaohongshu', 'kuaishou', 'bilibili', 'youtube', 'tiktok', 'instagram', 'twitter', 'weibo', 'facebook', 'vimeo', 'reddit', 'dailymotion', 'soundcloud', 'pinterest', 'threads', 'tumblr', 'twitch']);
+
+function cookieDirPath() {
+  return process.env.COOKIE_DIR || '/app/cookies';
+}
+
+function cookieFilePath(platformId) {
+  const id = String(platformId || '').replace(/[^a-z0-9_-]/gi, '');
+  if (!manageableCookiePlatforms.has(id)) {
+    const error = new Error('不支持维护该平台 Cookie。');
+    error.statusCode = 400;
+    throw error;
+  }
+  return path.join(cookieDirPath(), `${id}.txt`);
+}
+
+const defaultCookieDomains = {
+  douyin: '.douyin.com',
+  xiaohongshu: '.xiaohongshu.com',
+  kuaishou: '.kuaishou.com',
+  bilibili: '.bilibili.com',
+  youtube: '.youtube.com',
+  tiktok: '.tiktok.com',
+  instagram: '.instagram.com',
+  twitter: '.x.com',
+  weibo: '.weibo.com'
+};
+
+function truth(value) {
+  return value === true || value === 'true' || value === 'TRUE' ? 'TRUE' : 'FALSE';
+}
+
+function normalizeCookieDomain(domain, platformId) {
+  const fallback = defaultCookieDomains[platformId] || `.${platformId}.com`;
+  const value = String(domain || fallback).trim();
+  if (!value) return fallback;
+  if (value === 'localhost') return value;
+  return value.startsWith('.') ? value : `.${value}`;
+}
+
+function cookieExpires(cookie = {}) {
+  const raw = cookie.expirationDate ?? cookie.expires ?? cookie.expiry ?? cookie.expiration ?? cookie.expiration_date;
+  if (raw === undefined || raw === null || raw === '' || raw === -1) return '0';
+  const num = Number(raw);
+  if (!Number.isFinite(num)) return '0';
+  return String(Math.floor(num > 10_000_000_000 ? num / 1000 : num));
+}
+
+function cookieToNetscapeLine(cookie = {}, platformId = '') {
+  const name = String(cookie.name ?? cookie.key ?? '').trim();
+  const value = String(cookie.value ?? '').replace(/\r?\n/g, '');
+  if (!name) return '';
+  const domain = normalizeCookieDomain(cookie.domain ?? cookie.host ?? cookie.urlHost, platformId);
+  const includeSubdomains = domain.startsWith('.') ? 'TRUE' : truth(cookie.hostOnly === false || cookie.includeSubdomains);
+  const pathValue = String(cookie.path || '/');
+  const secure = truth(cookie.secure);
+  const expires = cookieExpires(cookie);
+  return [domain, includeSubdomains, pathValue, secure, expires, name, value].join('\t');
+}
+
+function parseCookieJson(value, platformId) {
+  const parsed = JSON.parse(value);
+  let cookies = Array.isArray(parsed) ? parsed : parsed.cookies || parsed.cookie || parsed.data || parsed.items;
+  if (!Array.isArray(cookies)) {
+    // Cookie Control Center / some extensions may export an object keyed by name.
+    cookies = Object.entries(parsed).filter(([, v]) => v && typeof v === 'object').map(([name, cookie]) => ({ name, ...cookie }));
+  }
+  const lines = cookies.map(cookie => cookieToNetscapeLine(cookie, platformId)).filter(Boolean);
+  if (!lines.length) throw new Error('JSON 中没有识别到 Cookie 条目。');
+  return ['# Netscape HTTP Cookie File', ...lines].join('\n') + '\n';
+}
+
+function parseCookieHeader(value, platformId) {
+  const domain = defaultCookieDomains[platformId] || `.${platformId}.com`;
+  const parts = value
+    .split(/[;\r\n]+/)
+    .map(part => part.trim())
+    .filter(Boolean)
+    .filter(part => !part.startsWith('#'));
+  const lines = parts.map(part => {
+    const eq = part.indexOf('=');
+    if (eq <= 0) return '';
+    const name = part.slice(0, eq).trim();
+    const cookieValue = part.slice(eq + 1).trim().replace(/[\r\n\t]/g, '');
+    if (!name || /\s/.test(name)) return '';
+    return [domain, 'TRUE', '/', 'FALSE', '0', name, cookieValue].join('\t');
+  }).filter(Boolean);
+  if (!lines.length) throw new Error('没有识别到 name=value Cookie。');
+  return ['# Netscape HTTP Cookie File', ...lines].join('\n') + '\n';
+}
+
+function validateCookieText(text = '', platformId = '') {
+  const value = String(text || '').trim();
+  if (!value) {
+    const error = new Error('Cookie 内容不能为空。');
+    error.statusCode = 400;
+    throw error;
+  }
+  if (value.length > 2 * 1024 * 1024) {
+    const error = new Error('Cookie 文件过大，当前限制 2MB。');
+    error.statusCode = 413;
+    throw error;
+  }
+  try {
+    if (/Netscape HTTP Cookie File/i.test(value) || /\tTRUE\t|\tFALSE\t/i.test(value)) {
+      return value.endsWith('\n') ? value : `${value}\n`;
+    }
+    if (/^\s*[\[{]/.test(value)) {
+      return parseCookieJson(value, platformId);
+    }
+    if (value.includes('=') && !value.includes('\tTRUE\t') && !value.includes('\tFALSE\t')) {
+      return parseCookieHeader(value, platformId);
+    }
+  } catch (error) {
+    const wrapped = new Error(`Cookie 格式识别失败：${error.message}`);
+    wrapped.statusCode = 400;
+    throw wrapped;
+  }
+  const error = new Error('未识别的 Cookie 格式。现在支持 Netscape cookies.txt、浏览器扩展 JSON 导出、以及 name=value; name2=value2 Cookie Header。');
+  error.statusCode = 400;
+  throw error;
+}
+
+
+const importantCookieNames = {
+  douyin: ['sessionid', 'sid_guard', 'uid_tt', 'sid_tt', 'passport_csrf_token', 's_v_web_id', '__ac_nonce', '__ac_signature'],
+  xiaohongshu: ['a1', 'web_session', 'webId', 'websectiga', 'gid'],
+  kuaishou: ['did', 'userId', 'kuaishou.server_st', 'kuaishou.api_st'],
+  youtube: ['SID', 'HSID', 'SSID', 'APISID', 'SAPISID', '__Secure-1PSID', '__Secure-3PSID', '__Secure-1PSIDTS', '__Secure-3PSIDTS', 'LOGIN_INFO']
+};
+
+function inspectCookieFile(platformId) {
+  const filePath = cookieFilePath(platformId);
+  if (!fs.existsSync(filePath)) return { exists: false, count: 0, validLines: 0, invalidLines: 0, names: [], important: {} };
+  const names = [];
+  let validLines = 0;
+  let invalidLines = 0;
+  for (const line of fs.readFileSync(filePath, 'utf8').split(/\r?\n/)) {
+    if (!line || line.startsWith('#')) continue;
+    const parts = line.split('\t');
+    if (parts.length === 7) {
+      validLines += 1;
+      names.push(parts[5]);
+    } else {
+      invalidLines += 1;
+    }
+  }
+  const important = Object.fromEntries((importantCookieNames[platformId] || []).map(name => [name, names.includes(name)]));
+  const missingImportant = Object.entries(important).filter(([, ok]) => !ok).map(([name]) => name);
+  const hint = platformId === 'youtube' && missingImportant.length ? 'YouTube Cookie 已保存但可能不完整：缺少部分登录态字段。若仍 bot-check，请从已登录且能正常播放该视频的浏览器重新导出完整 cookies.txt。' : '';
+  return { exists: true, count: names.length, validLines, invalidLines, names, important, hint }; 
+}
+
+app.get('/api/cookies/:platform/check', (req, res, next) => {
+  try {
+    const result = inspectCookieFile(req.params.platform);
+    res.json({ ok: result.exists && result.validLines > 0 && result.invalidLines === 0, platform: req.params.platform, ...result });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.post('/api/cookies/:platform', (req, res, next) => {
+  try {
+    const filePath = cookieFilePath(req.params.platform);
+    const raw = typeof req.body === 'string' ? req.body : req.body?.content;
+    const content = validateCookieText(raw, req.params.platform);
+    fs.mkdirSync(cookieDirPath(), { recursive: true });
+    if (fs.existsSync(filePath)) {
+      fs.copyFileSync(filePath, `${filePath}.bak`);
+    }
+    fs.writeFileSync(filePath, content, { mode: 0o600 });
+    appendHistory({ kind: 'cookie', ok: true, platform: req.params.platform, title: 'cookie updated' });
+    res.json({ ok: true, platform: req.params.platform, configured: true, bytes: Buffer.byteLength(content) });
+  } catch (error) {
+    appendHistory({ kind: 'cookie', ok: false, platform: req.params.platform, error: error.message });
+    next(error);
+  }
+});
+
+app.delete('/api/cookies/:platform', (req, res, next) => {
+  try {
+    const filePath = cookieFilePath(req.params.platform);
+    if (fs.existsSync(filePath)) {
+      fs.copyFileSync(filePath, `${filePath}.bak`);
+      fs.unlinkSync(filePath);
+    }
+    appendHistory({ kind: 'cookie', ok: true, platform: req.params.platform, title: 'cookie deleted' });
+    res.json({ ok: true, platform: req.params.platform, configured: false });
+  } catch (error) {
+    appendHistory({ kind: 'cookie', ok: false, platform: req.params.platform, error: error.message });
+    next(error);
+  }
+});
+
+app.get('/api/self-test', async (req, res) => {
+  const started = Date.now();
+  const checks = [];
+  const add = (name, ok, detail = {}) => checks.push({ name, ok: Boolean(ok), ...detail });
+
+  const ytDlpVersion = await commandVersion('yt-dlp');
+  const ffmpegVersion = await commandVersion('ffmpeg', ['-version']);
+  add('yt-dlp installed', Boolean(ytDlpVersion), { version: ytDlpVersion });
+  add('ffmpeg installed', Boolean(ffmpegVersion), { version: ffmpegVersion });
+
+  try {
+    ensureDataDir();
+    fs.accessSync(dataDir, fs.constants.W_OK);
+    add('data dir writable', true, { path: dataDir });
+  } catch (error) {
+    add('data dir writable', false, { path: dataDir, error: error.message });
+  }
+
+  try {
+    const cookieStatus = getCookieStatus();
+    add('cookie status readable', true, { cookies: cookieStatus, downloadCookieRequirements: getDownloadCookieRequirementStatus() });
+    fs.accessSync(cookieDirPath(), fs.constants.W_OK);
+    add('cookie dir writable', true, { path: cookieDirPath() });
+  } catch (error) {
+    add('cookie status readable', false, { error: error.message });
+    add('cookie dir writable', false, { path: cookieDirPath(), error: error.message });
+  }
+
+  try {
+    const testUrl = 'https://www.youtube.com/watch?v=dQw4w9WgXcQ';
+    const platform = detectPlatform(testUrl);
+    add('platform detection', platform.id === 'youtube', { platform: platform.id });
+  } catch (error) {
+    add('platform detection', false, { error: error.message });
+  }
+
+  try {
+    const entries = readHistory(3);
+    add('history readable', Array.isArray(entries), { count: entries.length });
+  } catch (error) {
+    add('history readable', false, { error: error.message });
+  }
+
+  const ok = checks.every(check => check.ok);
+  res.status(ok ? 200 : 500).json({
+    ok,
+    service: 'OnePick Tools',
+    version: appVersion,
+    durationMs: Date.now() - started,
+    checks
+  });
+});
+
+app.get('/api/history', (req, res) => {
+  res.json({ entries: readHistory(req.query.limit || 50) });
+});
+
+app.delete('/api/history', (req, res, next) => {
+  try {
+    const deleted = clearHistory();
+    res.json({ ok: true, deleted });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.get('/api/runtime', async (req, res) => {
+  const [ytDlpVersion, ffmpegVersion] = await Promise.all([
+    commandVersion('yt-dlp'),
+    commandVersion('ffmpeg', ['-version'])
+  ]);
+  res.json({
+    service: 'OnePick Tools',
+    version: appVersion,
+    node: process.version,
+    env: process.env.NODE_ENV || 'development',
+    cookieDir: process.env.COOKIE_DIR || '/app/cookies',
+    cookies: getCookieStatus(),
+    proxy: getProxyStatus(),
+    downloadCookieRequirements: getDownloadCookieRequirementStatus(),
+    tools: {
+      ytDlp: ytDlpVersion,
+      ffmpeg: ffmpegVersion
+    },
+    platforms: listSupportedPlatforms(),
+    time: new Date().toISOString()
+  });
+});
+
+app.get('/api/config', (req, res) => {
+  res.json({
+    cookieDir: process.env.COOKIE_DIR || '/app/cookies',
+    cookies: getCookieStatus(),
+    proxy: getProxyStatus(),
+    downloadCookieRequirements: getDownloadCookieRequirementStatus()
+  });
+});
+
+
+app.post('/api/proxy', (req, res, next) => {
+  try {
+    const raw = typeof req.body === 'string' ? req.body : (req.body?.url || '');
+    const url = validateProxyUrl(raw);
+    const enabled = req.body?.enabled === undefined ? Boolean(url) : Boolean(req.body.enabled);
+    const filePath = proxyConfigPath();
+    fs.mkdirSync(path.dirname(filePath), { recursive: true });
+    const payload = { enabled: Boolean(enabled && url), url, updatedAt: new Date().toISOString() };
+    fs.writeFileSync(filePath, JSON.stringify(payload, null, 2), { mode: 0o600 });
+    appendHistory({ kind: 'proxy', ok: true, title: payload.enabled ? 'proxy updated' : 'proxy disabled' });
+    res.json({ ok: true, proxy: getProxyStatus() });
+  } catch (error) {
+    appendHistory({ kind: 'proxy', ok: false, error: error.message });
+    next(error);
+  }
+});
+
+app.delete('/api/proxy', (req, res, next) => {
+  try {
+    const filePath = proxyConfigPath();
+    if (fs.existsSync(filePath)) {
+      fs.copyFileSync(filePath, `${filePath}.bak`);
+      fs.unlinkSync(filePath);
+    }
+    appendHistory({ kind: 'proxy', ok: true, title: 'proxy deleted' });
+    res.json({ ok: true, proxy: getProxyStatus() });
+  } catch (error) {
+    appendHistory({ kind: 'proxy', ok: false, error: error.message });
+    next(error);
+  }
+});
+
+app.get('/api/tools', (req, res) => {
+  res.json({
+    tools: [
+      {
+        id: 'media-parser',
+        name: '作品解析下载',
+        status: 'alpha',
+        description: '基于 yt-dlp 的第一版通用解析引擎，后续接平台专用解析器。',
+        platforms: listSupportedPlatforms()
+      }
+    ]
+  });
+});
+
+
+function safeDownloadName(name = 'onepick-media') {
+  return String(name)
+    .replace(/[\\/:*?"<>|\n\r]+/g, '_')
+    .replace(/^\.+$/, 'onepick-media')
+    .slice(0, 120) || 'onepick-media';
+}
+
+function contentDisposition(filename) {
+  const safe = safeDownloadName(filename);
+  const ascii = safe.replace(/[^ -~]/g, '_').replace(/"/g, '').slice(0, 120) || 'onepick-media';
+  const encoded = encodeURIComponent(safe).replace(/[()]/g, escape);
+  return `attachment; filename="${ascii}"; filename*=UTF-8''${encoded}`;
+}
+
+
+function downloadCookiePlatformForUrl(targetUrl = '', explicitPlatform = '') {
+  const explicit = String(explicitPlatform || '').replace(/[^a-z0-9_-]/gi, '');
+  if (requiresCookieForDownload(explicit)) return explicit;
+  try {
+    const host = new URL(targetUrl).hostname.toLowerCase();
+    if (/xiaohongshu|xhscdn|sns/i.test(host)) return 'xiaohongshu';
+    if (/kuaishou|kwaicdn|gifshow|chenzhongtech/i.test(host)) return 'kuaishou';
+  } catch {}
+  return '';
+}
+
+function enforceDownloadCookieRequirement(targetUrl = '', explicitPlatform = '') {
+  const platformId = downloadCookiePlatformForUrl(targetUrl, explicitPlatform);
+  if (platformId) assertCookieForDownload(platformId);
+  return platformId;
+}
+
+function mediaFetchHeaders(targetUrl = '', platformId = '') {
+  const headers = {
+    'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36',
+    'Accept': 'video/webm,video/mp4,video/*,*/*',
+    'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+    'Range': 'bytes=0-'
+  };
+  try {
+    const host = new URL(targetUrl).hostname.toLowerCase();
+    if (/douyin|douyinvod|byte/i.test(host)) {
+      headers.Referer = 'https://www.douyin.com/';
+      headers.Origin = 'https://www.douyin.com';
+    } else if (/xiaohongshu|xhscdn|sns/i.test(host)) {
+      headers.Referer = 'https://www.xiaohongshu.com/';
+      headers.Origin = 'https://www.xiaohongshu.com';
+    } else if (/kuaishou|kwaicdn|gifshow|chenzhongtech/i.test(host)) {
+      headers.Referer = 'https://www.kuaishou.com/';
+      headers.Origin = 'https://www.kuaishou.com';
+    } else if (/bilibili|bilivideo/i.test(host)) {
+      headers.Referer = 'https://www.bilibili.com/';
+      headers.Origin = 'https://www.bilibili.com';
+    } else if (/youtube|googlevideo/i.test(host)) {
+      headers.Referer = 'https://www.youtube.com/';
+      headers.Origin = 'https://www.youtube.com';
+    } else if (/weibo|sinaimg/i.test(host)) {
+      headers.Referer = 'https://weibo.com/';
+      headers.Origin = 'https://weibo.com';
+    } else if (/tiktok|tiktokcdn/i.test(host)) {
+      headers.Referer = 'https://www.tiktok.com/';
+      headers.Origin = 'https://www.tiktok.com';
+    }
+  } catch {}
+  const cookiePlatform = platformId || downloadCookiePlatformForUrl(targetUrl);
+  const cookieHeader = cookiePlatform ? getCookieHeader(cookiePlatform) : '';
+  if (cookieHeader) headers.Cookie = cookieHeader;
+  return headers;
+}
+
+
+function ytdlpFormatSelector(preferences = {}) {
+  const prefs = normalizeParsePreferences(preferences);
+  if (prefs.mode === 'audio') return 'ba[ext=m4a]/ba/bestaudio/b';
+  if (prefs.quality === 'best') return 'b[ext=mp4]/b';
+  const height = Number(prefs.quality);
+  return `b[height<=${height}][ext=mp4]/b[height<=${height}]/b[ext=mp4]/b`;
+}
+
+function ytdlpDownloadArgs(sourceUrl = '', preferences = {}) {
+  return [
+    ...getProxyArgs(),
+    ...getCookieDownloadArgs('youtube'),
+    '--js-runtimes', 'node:/usr/local/bin/node',
+    '--remote-components', 'ejs:github',
+    '--no-playlist',
+    '--no-warnings',
+    '--force-overwrites',
+    '-f', ytdlpFormatSelector(preferences),
+    '-o', '-',
+    sourceUrl
+  ];
+}
+
+function getCookieDownloadArgs(platformId = '') {
+  const cookiePath = path.join(process.env.COOKIE_DIR || '/app/cookies', `${String(platformId).replace(/[^a-z0-9_-]/gi, '')}.txt`);
+  return fs.existsSync(cookiePath) && fs.statSync(cookiePath).size > 0 ? ['--cookies', cookiePath] : [];
+}
+
+async function streamYtDlpDownload({ sourceUrl, filename, preferences, req, res, next }) {
+  try {
+    if (!sourceUrl) {
+      const error = new Error('缺少 source 参数。');
+      error.statusCode = 400;
+      throw error;
+    }
+    await assertPublicUrl(sourceUrl);
+    const platform = detectPlatform(sourceUrl);
+    if (platform.id !== 'youtube') {
+      const error = new Error('yt-dlp 下载代理当前只允许 YouTube 源链接。');
+      error.statusCode = 400;
+      throw error;
+    }
+
+    const safeFilename = safeDownloadName(filename || 'youtube-video.mp4');
+    res.setHeader('Content-Type', preferences.mode === 'audio' ? 'audio/mp4' : (safeFilename.endsWith('.webm') ? 'video/webm' : 'video/mp4'));
+    res.setHeader('Content-Disposition', contentDisposition(safeFilename));
+    res.setHeader('Cache-Control', 'private, max-age=0, no-store');
+
+    const child = spawn('yt-dlp', ytdlpDownloadArgs(sourceUrl, preferences), { cwd: path.join(__dirname, '..'), stdio: ['ignore', 'pipe', 'pipe'] });
+    let stderr = '';
+    child.stderr.on('data', chunk => { stderr += chunk.toString(); if (stderr.length > 4000) stderr = stderr.slice(-4000); });
+    req.on('close', () => { if (!child.killed) child.kill('SIGTERM'); });
+    child.on('error', error => {
+      if (res.headersSent) res.destroy(error);
+      else next(error);
+    });
+    child.on('close', code => {
+      if (code && !res.headersSent) {
+        const error = new Error(stderr.split('\n').filter(Boolean).slice(-4).join('\n') || `yt-dlp 下载失败：${code}`);
+        error.statusCode = 502;
+        next(error);
+      }
+    });
+    await pipeline(child.stdout, res);
+  } catch (error) {
+    if (res.headersSent) {
+      res.destroy(error);
+      return;
+    }
+    next(error);
+  }
+}
+
+async function streamRemoteDownload({ targetUrl, filename, platform, req, res, next }) {
+  try {
+    if (!targetUrl) {
+      const error = new Error('缺少 url 参数。');
+      error.statusCode = 400;
+      throw error;
+    }
+    await assertPublicUrl(targetUrl);
+    const cookiePlatform = enforceDownloadCookieRequirement(targetUrl, platform);
+
+    const upstream = await fetch(targetUrl, {
+      redirect: 'follow',
+      headers: mediaFetchHeaders(targetUrl, cookiePlatform)
+    });
+
+    if (!upstream.ok || !upstream.body) {
+      const error = new Error(`下载源返回 ${upstream.status}`);
+      error.statusCode = 502;
+      throw error;
+    }
+
+    res.setHeader('Content-Type', upstream.headers.get('content-type') || 'application/octet-stream');
+    const length = upstream.headers.get('content-length');
+    if (length) res.setHeader('Content-Length', length);
+    res.setHeader('Content-Disposition', contentDisposition(filename || 'onepick-media'));
+    res.setHeader('Cache-Control', 'private, max-age=0, no-store');
+
+    await pipeline(Readable.fromWeb(upstream.body), res);
+  } catch (error) {
+    if (res.headersSent) {
+      res.destroy(error);
+      return;
+    }
+    next(error);
+  }
+}
+
+app.get('/api/ytdlp-download', async (req, res, next) => {
+  const sourceUrl = String(req.query.source || '');
+  const filename = safeDownloadName(req.query.filename || 'youtube-video.mp4');
+  const preferences = normalizeParsePreferences({ mode: req.query.mode, quality: req.query.quality });
+  await streamYtDlpDownload({ sourceUrl, filename, preferences, req, res, next });
+});
+
+app.get('/api/download', async (req, res, next) => {
+  const targetUrl = String(req.query.url || '');
+  const filename = safeDownloadName(req.query.filename || 'onepick-media');
+  await streamRemoteDownload({ targetUrl, filename, platform: req.query.platform, req, res, next });
+});
+
+
+
+app.post('/api/douyin/browser-diagnose', async (req, res, next) => {
+  const started = Date.now();
+  const input = requestInputText(req.body || {});
+  try {
+    const { stdout, stderr } = await execFileAsync('node', ['scripts/douyin-browser-diagnose.js', input], { cwd: path.join(__dirname, '..'), timeout: 60000, maxBuffer: 8 * 1024 * 1024 });
+    const payload = JSON.parse(stdout);
+    appendHistory({ kind: 'douyin-browser-diagnose', ok: payload.ok, durationMs: Date.now() - started, platform: 'douyin', sourceUrl: input, title: payload.ok ? 'browser diagnose ok' : (payload.error || payload.page?.title || 'browser diagnose') });
+    res.status(payload.ok ? 200 : 422).json({ ...payload, stderr: stderr?.slice(0, 1000) || '' });
+  } catch (error) {
+    let payload = null;
+    try { payload = JSON.parse(error.stdout || ''); } catch {}
+    appendHistory({ kind: 'douyin-browser-diagnose', ok: false, durationMs: Date.now() - started, platform: 'douyin', sourceUrl: input, error: payload?.error || error.message });
+    if (payload) return res.status(422).json(payload);
+    next(error);
+  }
+});
+
+app.post('/api/inspect', async (req, res, next) => {
+  const started = Date.now();
+  const input = requestInputText(req.body || {});
+  try {
+    const url = extractFirstUrl(input);
+    if (!url) {
+      const error = new Error('没有识别到有效链接，请粘贴包含 http/https 的作品分享内容。');
+      error.statusCode = 400;
+      throw error;
+    }
+    await assertPublicUrl(url);
+    const platform = detectPlatform(url);
+    let redirect = null;
+    try {
+      redirect = await resolveRedirects(url, { maxRedirects: 8 });
+    } catch (error) {
+      redirect = { finalUrl: url, chain: [], error: error.message };
+    }
+    const finalUrl = redirect?.finalUrl || url;
+    const flags = [];
+    if (/captcha|verify|login|passport/i.test(finalUrl)) flags.push('可能触发登录/验证码');
+    if (/\/user\/|\/profile\/|\/u\//i.test(finalUrl)) flags.push('看起来像主页/用户链接，不一定是作品链接');
+    if (platform.id === 'generic') flags.push('未知/通用平台，将使用 generic parser');
+    const result = { code: 200, status: 'ok', inputLength: String(input).length, extractedUrl: url, platform, finalUrl, redirectChain: redirect?.chain || [], flags, durationMs: Date.now() - started };
+    appendHistory({ kind: 'inspect', ok: true, durationMs: result.durationMs, platform: platform.id, sourceUrl: url, title: flags.join('；') || 'inspect ok' });
+    res.json(result);
+  } catch (error) {
+    appendHistory({ kind: 'inspect', ok: false, durationMs: Date.now() - started, sourceUrl: input, error: error.message });
+    next(error);
+  }
+});
+
+app.post('/api/parse', async (req, res, next) => {
+  const started = Date.now();
+  const input = requestInputText(req.body || {});
+  const preferences = normalizeParsePreferences(req.body?.preferences || req.body || {});
+  try {
+    const result = await parseMedia({ input, preferences });
+    appendHistory({ kind: 'parse', ok: true, durationMs: Date.now() - started, platform: result.platform?.id, parser: result.parser || result.engine, title: result.title, sourceUrl: result.sourceUrl || input, itemCount: Array.isArray(result.items) ? result.items.length : 0 });
+    res.status(200).json(result);
+  } catch (error) {
+    let failedPlatform = null;
+    try {
+      const failedUrl = extractFirstUrl(input);
+      failedPlatform = failedUrl ? detectPlatform(failedUrl).id : null;
+    } catch {}
+    appendHistory({ kind: 'parse', ok: false, durationMs: Date.now() - started, platform: failedPlatform, sourceUrl: input, error: error.message });
+    next(error);
+  }
+});
+
+const shortcutSelectionThresholdBytes = 100 * 1024 * 1024;
+
+function itemQualityScore(item = {}) {
+  const quality = Number(String(item.quality || '').match(/\d+/)?.[0] || 0);
+  const width = Number(item.width || 0);
+  const height = Number(item.height || 0);
+  const filesize = Number(item.filesize || 0);
+  const typeBonus = item.type === 'video' ? 1000000000 : item.type === 'audio' ? 500000000 : 0;
+  return typeBonus + Math.max(quality, height) * 1000000 + width * 1000 + filesize;
+}
+
+function downloadableItems(items = []) {
+  return items
+    .map((item, index) => ({ ...item, originalIndex: index }))
+    .filter(item => item?.url)
+    .sort((a, b) => itemQualityScore(b) - itemQualityScore(a));
+}
+
+function selectShortcutItem(items = [], requestedIndex = null) {
+  const candidates = downloadableItems(items);
+  if (!candidates.length) return { item: null, candidates };
+  if (requestedIndex !== null && requestedIndex !== undefined && requestedIndex !== '') {
+    const index = Number(requestedIndex);
+    const selected = candidates.find(item => item.originalIndex === index) || candidates[index];
+    return { item: selected || candidates[0], candidates };
+  }
+  return { item: candidates[0], candidates };
+}
+
+function shortcutCandidateSummary(item = {}) {
+  return {
+    index: item.originalIndex,
+    title: item.title || item.filename || `media-${Number(item.originalIndex || 0) + 1}`,
+    filename: item.filename || '',
+    type: item.type || '',
+    quality: item.quality || '',
+    filesize: item.filesize || null,
+    filesizeMB: item.filesize ? Math.round(Number(item.filesize) / 1024 / 1024) : null
+  };
+}
+
+function shortcutPreferences(body = {}) {
+  return normalizeParsePreferences(body.preferences || { mode: body.mode, quality: body.quality });
+}
+
+async function sendShortcutDownload({ input, preferences, itemIndex, started, req, res, next }) {
+  const parsed = await parseMedia({ input, preferences });
+  const { item, candidates } = selectShortcutItem(parsed.items, itemIndex);
+  if (!item) {
+    const error = new Error('没有找到可下载的媒体文件。');
+    error.statusCode = 404;
+    throw error;
+  }
+
+  const selectedSize = Number(item.filesize || 0);
+  if (candidates.length > 1 && selectedSize > shortcutSelectionThresholdBytes && (itemIndex === undefined || itemIndex === null || itemIndex === '')) {
+    res.status(409).json({
+      error: '最高质量文件超过 100MB，请选择要下载的项目。',
+      needsSelection: true,
+      thresholdBytes: shortcutSelectionThresholdBytes,
+      selectedIndex: item.originalIndex,
+      candidates: candidates.map(shortcutCandidateSummary)
+    });
+    return;
+  }
+
+  const filename = safeDownloadName(item.filename || `${parsed.platform?.id || 'onepick'}-${Date.now()}.${item.ext || (preferences.mode === 'audio' ? 'm4a' : 'mp4')}`);
+  res.setHeader('X-OnePick-Item-Count', String(Array.isArray(parsed.items) ? parsed.items.length : 1));
+  res.setHeader('X-OnePick-Platform', String(parsed.platform?.id || item.platform || 'unknown'));
+  res.setHeader('X-OnePick-Selected-Filename', encodeURIComponent(filename));
+  appendHistory({ kind: 'shortcut', ok: true, durationMs: Date.now() - started, platform: parsed.platform?.id, parser: parsed.parser || parsed.engine, title: parsed.title, sourceUrl: parsed.sourceUrl || input, itemCount: Array.isArray(parsed.items) ? parsed.items.length : 1 });
+
+  if (String(item.url).startsWith('/api/ytdlp-download')) {
+    const shortcutUrl = new URL(item.url, 'http://127.0.0.1');
+    const sourceUrl = shortcutUrl.searchParams.get('source') || '';
+    const proxyFilename = shortcutUrl.searchParams.get('filename') || filename;
+    const proxyPreferences = normalizeParsePreferences({ mode: shortcutUrl.searchParams.get('mode') || preferences.mode, quality: shortcutUrl.searchParams.get('quality') || preferences.quality });
+    await streamYtDlpDownload({ sourceUrl, filename: proxyFilename, preferences: proxyPreferences, req, res, next });
+    return;
+  }
+
+  if (String(item.url).startsWith('/')) {
+    const error = new Error(`快捷指令接口暂不支持内部下载路径：${item.url}`);
+    error.statusCode = 501;
+    throw error;
+  }
+
+  await streamRemoteDownload({ targetUrl: item.url, filename, platform: item.platform || parsed.platform?.id, req, res, next });
+}
+
+app.post('/api/shortcut/download', async (req, res, next) => {
+  const started = Date.now();
+  const input = requestInputText(req.body || {});
+  const preferences = shortcutPreferences(req.body || {});
+  try {
+    if (!extractFirstUrl(input)) {
+      console.warn('Shortcut request missing URL', JSON.stringify(shortcutRequestDebug(req.body || {}, input)));
+    }
+    await sendShortcutDownload({ input, preferences, itemIndex: req.body?.itemIndex, started, req, res, next });
+  } catch (error) {
+    appendHistory({ kind: 'shortcut', ok: false, durationMs: Date.now() - started, sourceUrl: input, error: error.message });
+    next(error);
+  }
+});
+
+app.post('/api/shortcut/download-text', async (req, res, next) => {
+  const started = Date.now();
+  const input = typeof req.body === 'string' ? req.body : requestInputText(req.body || {});
+  const preferences = normalizeParsePreferences({ mode: req.query?.mode, quality: req.query?.quality });
+  try {
+    if (!extractFirstUrl(input)) {
+      console.warn('Shortcut text request missing URL', JSON.stringify({ inputLength: String(input || '').length, inputPreview: String(input || '').replace(/https?:\/\/\S+/gi, '<url>').slice(0, 80) }));
+    }
+    await sendShortcutDownload({ input, preferences, itemIndex: req.query?.itemIndex, started, req, res, next });
+  } catch (error) {
+    appendHistory({ kind: 'shortcut-text', ok: false, durationMs: Date.now() - started, sourceUrl: input, error: error.message });
+    next(error);
+  }
+});
+
+
+app.post('/api/archive', async (req, res, next) => {
+  const started = Date.now();
+  try {
+    const items = Array.isArray(req.body?.items) ? req.body.items : [];
+    const archiveName = safeDownloadName(req.body?.filename || 'onepick-downloads.zip');
+    const limited = items.slice(0, 50).map((item, index) => ({
+      url: String(item?.url || ''),
+      filename: safeDownloadName(item?.filename || `media-${index + 1}`),
+      platform: String(item?.platform || item?.platformId || '')
+    })).filter(item => item.url);
+
+    if (!limited.length) {
+      const error = new Error('缺少可打包的下载项。');
+      error.statusCode = 400;
+      throw error;
+    }
+
+    for (const item of limited) {
+      await assertPublicUrl(item.url);
+      item.cookiePlatform = enforceDownloadCookieRequirement(item.url, item.platform);
+    }
+
+    res.setHeader('Content-Type', 'application/zip');
+    res.setHeader('Content-Disposition', contentDisposition(archiveName.endsWith('.zip') ? archiveName : `${archiveName}.zip`));
+    res.setHeader('Cache-Control', 'private, max-age=0, no-store');
+
+    const archive = archiver('zip', { zlib: { level: 6 } });
+    archive.on('error', error => {
+      if (!res.headersSent) next(error);
+      else res.destroy(error);
+    });
+    archive.pipe(res);
+
+    for (const [index, item] of limited.entries()) {
+      try {
+        const upstream = await fetch(item.url, {
+          redirect: 'follow',
+          headers: mediaFetchHeaders(item.url, item.cookiePlatform)
+        });
+        if (!upstream.ok || !upstream.body) {
+          archive.append(`Failed to fetch ${item.url}: HTTP ${upstream.status}\n`, { name: `_errors/item-${index + 1}.txt` });
+          continue;
+        }
+        archive.append(Readable.fromWeb(upstream.body), { name: item.filename });
+      } catch (error) {
+        archive.append(`Failed to fetch ${item.url}: ${error.message}\n`, { name: `_errors/item-${index + 1}.txt` });
+      }
+    }
+
+    await archive.finalize();
+    appendHistory({ kind: 'archive', ok: true, durationMs: Date.now() - started, title: archiveName, itemCount: limited.length });
+  } catch (error) {
+    appendHistory({ kind: 'archive', ok: false, durationMs: Date.now() - started, error: error.message });
+    next(error);
+  }
+});
+
+app.get('/config', (req, res) => {
+  res.sendFile(path.join(staticDir, 'config.html'));
+});
+
+app.use((req, res) => {
+  if (req.path.startsWith('/api/')) {
+    res.status(404).json({ error: 'Not found' });
+    return;
+  }
+  res.sendFile(path.join(staticDir, 'index.html'));
+});
+
+app.use((error, req, res, next) => {
+  if (res.headersSent) {
+    next(error);
+    return;
+  }
+  const statusCode = error.statusCode || 500;
+  res.status(statusCode).json({ error: error.message || 'Internal Server Error' });
+});
+
+app.listen(port, '0.0.0.0', () => {
+  console.log(`OnePick Tools listening on :${port}`);
+});

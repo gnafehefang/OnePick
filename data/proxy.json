@@ -1,0 +1,9 @@
+{
+  "enabled": true,
+  "url": "http://192.168.199.5:1999/",
+  "backups": [
+    "http://192.168.199.5:4444/"
+  ],
+  "platformModes": {},
+  "updatedAt": "2026-07-30T01:13:58.135Z"
+}

@@ -1,0 +1,29 @@
+# OnePick Parser Notes
+
+## Architecture
+
+`src/parsers/index.js` routes by platform id:
+
+- `douyin` -> dedicated parser
+- others -> generic `yt-dlp` parser for now
+
+Shared utilities live in `src/parsers/shared.js`:
+
+- URL extraction
+- platform detection
+- internal/private URL protection
+- redirect resolution
+- yt-dlp normalization
+- unified response shape
+
+## Add a dedicated parser
+
+1. Create `src/parsers/<platform>.js`.
+2. Export `parse<Platform>({ url, platform })`.
+3. Return `buildParseResponse(...)`.
+4. Register it in `src/parsers/index.js` `PARSERS`.
+
+## Current status
+
+- Douyin: dedicated preprocessor + yt-dlp fallback. Handles short-link redirects and work id extraction.
+- Generic: yt-dlp fallback for YouTube/TikTok/Bilibili/etc where supported.

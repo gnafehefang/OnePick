@@ -1,0 +1,479 @@
+const form = document.querySelector('#parse-form');
+const input = document.querySelector('#input');
+const result = document.querySelector('#result');
+const presetPanel = document.querySelector('#preset-panel');
+const accountTrigger = document.querySelector('#account-trigger');
+const accountPopover = document.querySelector('#account-popover');
+const accountUser = document.querySelector('#account-user');
+const tokenBox = document.querySelector('#token-box');
+const accountToken = document.querySelector('#account-token');
+const accountDialog = document.querySelector('#account-dialog');
+const accountForm = document.querySelector('#account-form');
+const accountUsername = document.querySelector('#account-username');
+const accountFormStatus = document.querySelector('#account-form-status');
+
+let lastItems = [];
+let lastArchiveTitle = 'onepick-downloads';
+let queueItems = [];
+let outputPreferences = { mode: 'video', quality: 'best' };
+
+async function fetchJson(url, options = {}) {
+  const response = await fetch(url, options);
+  const payload = await response.json().catch(() => ({}));
+  if (response.status === 401) {
+    location.href = `/login?next=${encodeURIComponent(location.pathname + location.search)}`;
+    throw new Error('Unauthorized');
+  }
+  if (!response.ok) throw new Error(payload.error || '请求失败');
+  return payload;
+}
+
+function escapeHtml(value = '') {
+  return String(value).replace(/[&<>'"]/g, char => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', "'": '&#39;', '"': '&quot;' }[char]));
+}
+
+function errorAdvice(message = '') {
+  if (/抖音接口仍拒绝|web detail API|a_bogus|msToken|Fresh cookies/i.test(message)) {
+    return '建议：当前已不是 Cookie 保存格式问题，而是抖音接口风控/签名环境问题。下一步需要接入浏览器抓包或 a_bogus/msToken 签名方案；不要再反复只更新 Cookie。';
+  }
+  if (/登录态已存在|没有从这个笔记提取到可下载媒体/i.test(message)) return '建议：这次不是 Cookie 没配；需要补小红书专用解析/浏览器抓包逻辑，或先换另一个公开视频笔记验证。';
+  if (/YouTube Cookie 已检测到|Requested format is not available|storyboard/i.test(message)) return '建议：Cookie 文件已存在，但 YouTube 只返回缩略图格式，说明当前登录态/账号/代理仍被风控。请重新从能正常播放该视频的浏览器导出完整 YouTube cookies.txt，或更换代理出口。';
+  if (/youtube|Sign in to confirm you.re not a bot|not a bot/i.test(message)) return '建议：这类 YouTube 风控通常需要 Cookie + 可用代理。请到 /config 查看 YouTube Cookie，并在“代理维护”里配置 http/socks5 代理后重试。';
+  if (/cookie|验证码|登录|bot|Sign in/i.test(message)) return '建议：打开 /config 查看 Cookie 状态，给对应平台配置 cookies.txt 后重试。';
+  if (/主页|首页|用户链接|不是作品/i.test(message)) return '建议：请复制具体作品/笔记/视频的分享链接，而不是主页链接。';
+  if (/Unsupported URL|暂未解析/i.test(message)) return '建议：确认链接公开可访问；若仍失败，后续需要专用解析器或 Cookie。';
+  if (/没有识别到有效链接/i.test(message)) return '建议：粘贴完整分享文案也可以，我会自动提取里面的 http/https 链接。';
+  return '建议：换一个公开作品链接重试，或到 /config 查看最近错误。';
+}
+
+function formatBytes(bytes) {
+  if (!bytes) return '';
+  const units = ['B', 'KB', 'MB', 'GB'];
+  let value = Number(bytes);
+  let index = 0;
+  while (value >= 1024 && index < units.length - 1) { value /= 1024; index += 1; }
+  return `${value.toFixed(index ? 1 : 0)} ${units[index]}`;
+}
+
+function safeZipName(value = 'onepick-downloads') {
+  return String(value || 'onepick-downloads').replace(/[\\/:*?"<>|]+/g, '-').slice(0, 90) || 'onepick-downloads';
+}
+
+function extractUrls(value = '') {
+  const matches = String(value).match(/https?:\/\/[^\s<>"'，。；、]+/gi) || [];
+  const seen = new Set();
+  return matches
+    .map(url => url.replace(/[)\]}>）】》、，。；;,.]+$/g, ''))
+    .filter(url => {
+      if (seen.has(url)) return false;
+      seen.add(url);
+      return true;
+    });
+}
+
+function archiveItemsFromPayload(payload) {
+  return (Array.isArray(payload?.items) ? payload.items : [])
+    .filter(item => item?.url)
+    .map(item => ({ url: item.url, filename: item.filename, platform: payload.platform?.id || item.platform }));
+}
+
+function preferenceLabel(preferences = outputPreferences) {
+  if (preferences.mode === 'audio') return '仅音频';
+  return preferences.quality === 'best' ? '自动最佳' : `${preferences.quality}p 以内`;
+}
+
+function readOutputPreferences() {
+  const active = presetPanel?.querySelector('[data-preset].active');
+  if (!active) return outputPreferences;
+  outputPreferences = {
+    mode: active.dataset.mode === 'audio' ? 'audio' : 'video',
+    quality: active.dataset.quality || 'best'
+  };
+  return outputPreferences;
+}
+
+function setActivePreset(button) {
+  if (!button || !presetPanel) return;
+  presetPanel.querySelectorAll('[data-preset]').forEach(entry => {
+    const isActive = entry === button;
+    entry.classList.toggle('active', isActive);
+    entry.setAttribute('aria-pressed', String(isActive));
+  });
+  readOutputPreferences();
+}
+
+function renderItems(items = []) {
+  if (!items.length) return '<p class="muted-text">没有找到可下载媒体地址。</p>';
+  const archiveButton = items.length > 1 ? `<button class="button primary archive-button" type="button" data-archive="single">一键打包 ZIP</button>` : '';
+  return `${archiveButton}<div class="download-list">${items.map((item, index) => `
+    <article class="download-item">
+      <div>
+        <strong>${escapeHtml(item.filename || `media-${index + 1}`)}</strong>
+        <p>${escapeHtml(item.type || 'media')} ${item.height ? ` · ${item.height}p` : ''} ${item.filesize ? ` · ${formatBytes(item.filesize)}` : ''}</p>
+      </div>
+      <div class="download-actions">
+        <a class="button small" href="/api/download?url=${encodeURIComponent(item.url)}&filename=${encodeURIComponent(item.filename || `media-${index + 1}`)}">下载</a>
+        <a class="button small ghost" href="${escapeHtml(item.url)}" target="_blank" rel="noreferrer">源地址</a>
+      </div>
+    </article>
+  `).join('')}</div>`;
+}
+
+function renderInspect(payload) {
+  result.hidden = false;
+  const flags = payload.flags?.length ? payload.flags.map(flag => `<li>${escapeHtml(flag)}</li>`).join('') : '<li>未发现明显问题</li>';
+  result.innerHTML = `
+    <div class="inspect-card">
+      <p class="eyebrow">Inspect · ${escapeHtml(payload.platform?.name || '未知平台')}</p>
+      <h3>链接诊断完成</h3>
+      <p><strong>提取链接：</strong><a href="${escapeHtml(payload.extractedUrl)}" target="_blank" rel="noreferrer">${escapeHtml(payload.extractedUrl)}</a></p>
+      <p><strong>最终链接：</strong><a href="${escapeHtml(payload.finalUrl)}" target="_blank" rel="noreferrer">${escapeHtml(payload.finalUrl)}</a></p>
+      <p><strong>重定向次数：</strong>${escapeHtml(payload.redirectChain?.length || 0)} · ${escapeHtml(payload.durationMs || 0)}ms</p>
+      <ul>${flags}</ul>
+      <details><summary>查看诊断 JSON</summary><pre>${escapeHtml(JSON.stringify(payload, null, 2))}</pre></details>
+    </div>
+  `;
+}
+
+function renderResult(payload) {
+  result.hidden = false;
+  lastItems = archiveItemsFromPayload(payload);
+  lastArchiveTitle = payload.title || 'onepick-downloads';
+  const platformName = payload.platform?.name || '未知平台';
+  result.innerHTML = `
+    <div class="result-head">
+      ${payload.cover ? `<img src="${escapeHtml(payload.cover)}" alt="cover" />` : '<div class="cover-placeholder">1P</div>'}
+      <div>
+        <p class="eyebrow">${escapeHtml(platformName)} · ${escapeHtml(payload.engine || 'parser')}</p>
+        <h3>${escapeHtml(payload.title || '解析结果')}</h3>
+        <p><strong>标题：</strong>${escapeHtml(payload.title || '未命名作品')}</p>
+        <p class="muted-text">${escapeHtml([payload.author ? `作者：${payload.author}` : '', payload.duration ? `时长：${payload.duration}s` : '', `预设：${preferenceLabel(payload.preferences)}`].filter(Boolean).join(' · '))}</p>
+      </div>
+    </div>
+    ${renderItems(payload.items)}
+    <details>
+      <summary>查看原始 JSON</summary>
+      <pre>${escapeHtml(JSON.stringify(payload, null, 2))}</pre>
+    </details>
+  `;
+}
+
+function queueStats() {
+  const total = queueItems.length;
+  const done = queueItems.filter(item => item.status === 'done').length;
+  const failed = queueItems.filter(item => item.status === 'failed').length;
+  const running = queueItems.some(item => item.status === 'running');
+  const archiveCount = queueItems.reduce((sum, item) => sum + archiveItemsFromPayload(item.payload).length, 0);
+  return { total, done, failed, running, archiveCount };
+}
+
+function renderQueue() {
+  result.hidden = false;
+  const stats = queueStats();
+  const canArchive = stats.archiveCount > 0 && !stats.running;
+  result.innerHTML = `
+    <div class="queue-panel">
+      <div class="queue-toolbar">
+        <div>
+          <p class="eyebrow">Batch Queue</p>
+          <h3>批量解析 ${stats.done}/${stats.total}</h3>
+          <p class="muted-text">成功 ${stats.done} · 失败 ${stats.failed} · 可打包文件 ${stats.archiveCount} · ${escapeHtml(preferenceLabel())}</p>
+        </div>
+        <button class="button primary" type="button" data-archive="batch" ${canArchive ? '' : 'disabled'}>打包成功项 ZIP</button>
+      </div>
+      <div class="queue-list">${queueItems.map(item => renderQueueItem(item)).join('')}</div>
+    </div>
+  `;
+}
+
+function renderQueueItem(item) {
+  const statusText = { pending: '等待中', running: '解析中', done: '完成', failed: '失败' }[item.status] || item.status;
+  const payload = item.payload;
+  const count = archiveItemsFromPayload(payload).length;
+  const detail = item.status === 'done'
+    ? `${escapeHtml(payload?.platform?.name || '未知平台')} · ${count} 个可下载项`
+    : item.status === 'failed'
+      ? `${escapeHtml(item.error || '请求失败')} · ${escapeHtml(errorAdvice(item.error || ''))}`
+      : escapeHtml(item.url);
+  return `
+    <article class="queue-row ${escapeHtml(item.status)}">
+      <div class="queue-main">
+        <span class="queue-status">${escapeHtml(statusText)}</span>
+        <strong>${escapeHtml(payload?.title || item.url)}</strong>
+        <p>${detail}</p>
+      </div>
+      <div class="download-actions">
+        ${item.status === 'done' && count > 1 ? `<button class="button small ghost" type="button" data-archive-item="${item.id}">单项 ZIP</button>` : ''}
+        ${item.status === 'failed' ? `<button class="button small" type="button" data-retry="${item.id}">重试</button>` : ''}
+      </div>
+    </article>
+  `;
+}
+
+async function parseOne(rawInput) {
+  const preferences = readOutputPreferences();
+  const response = await fetch('/api/parse', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ input: rawInput, preferences })
+  });
+  const payload = await response.json();
+  if (!response.ok) throw new Error(payload.error || '请求失败');
+  return payload;
+}
+
+async function parseQueueItem(item) {
+  item.status = 'running';
+  item.error = '';
+  renderQueue();
+  try {
+    item.payload = await parseOne(item.input);
+    item.status = 'done';
+  } catch (error) {
+    item.status = 'failed';
+    item.error = error.message;
+  }
+  renderQueue();
+}
+
+async function runQueue() {
+  for (const item of queueItems) {
+    if (item.status === 'pending') await parseQueueItem(item);
+  }
+}
+
+function startBatch(urls) {
+  lastItems = [];
+  lastArchiveTitle = `onepick-batch-${new Date().toISOString().slice(0, 10)}`;
+  queueItems = urls.slice(0, 50).map((url, index) => ({ id: String(index), input: url, url, status: 'pending', payload: null, error: '' }));
+  renderQueue();
+  runQueue();
+}
+
+async function downloadArchive(items, filename, button) {
+  if (!items.length) return;
+  const originalText = button?.textContent;
+  if (button) {
+    button.disabled = true;
+    button.textContent = '正在打包...';
+  }
+  try {
+    const response = await fetch('/api/archive', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ filename: `${safeZipName(filename)}.zip`, items })
+    });
+    if (!response.ok) {
+      const payload = await response.json().catch(() => ({}));
+      throw new Error(payload.error || '打包失败');
+    }
+    const blob = await response.blob();
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `${safeZipName(filename)}.zip`;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(url);
+  } catch (error) {
+    alert(error.message);
+  } finally {
+    if (button) {
+      button.disabled = false;
+      button.textContent = originalText || '打包 ZIP';
+    }
+  }
+}
+
+form?.addEventListener('submit', async (event) => {
+  event.preventDefault();
+  const urls = extractUrls(input.value);
+  if (urls.length > 1) {
+    startBatch(urls);
+    return;
+  }
+  result.hidden = false;
+  result.textContent = '正在解析，第一次可能会稍慢...';
+  try {
+    renderResult(await parseOne(input.value));
+  } catch (error) {
+    result.innerHTML = `<div class="error-card"><strong>解析失败</strong><p>${escapeHtml(error.message)}</p><p class="muted-text">${escapeHtml(errorAdvice(error.message))}</p><a class="button small ghost" href="/config">查看状态 / 最近错误</a></div>`;
+  }
+});
+
+result?.addEventListener('click', async (event) => {
+  const archiveButton = event.target.closest('[data-archive]');
+  if (archiveButton?.dataset.archive === 'single') {
+    await downloadArchive(lastItems, lastArchiveTitle, archiveButton);
+    return;
+  }
+  if (archiveButton?.dataset.archive === 'batch') {
+    const items = queueItems.flatMap(item => archiveItemsFromPayload(item.payload));
+    await downloadArchive(items, lastArchiveTitle, archiveButton);
+    renderQueue();
+    return;
+  }
+
+  const retryButton = event.target.closest('[data-retry]');
+  if (retryButton) {
+    const item = queueItems.find(entry => entry.id === retryButton.dataset.retry);
+    if (item) await parseQueueItem(item);
+    return;
+  }
+
+  const itemArchiveButton = event.target.closest('[data-archive-item]');
+  if (itemArchiveButton) {
+    const item = queueItems.find(entry => entry.id === itemArchiveButton.dataset.archiveItem);
+    if (item) await downloadArchive(archiveItemsFromPayload(item.payload), item.payload?.title || item.url, itemArchiveButton);
+  }
+});
+
+async function loadPlatformStatus() {
+  const el = document.querySelector('#platform-status');
+  const summaryEl = document.querySelector('#runtime-summary');
+  if (!el && !summaryEl) return;
+  try {
+    const response = await fetch('/api/runtime');
+    const data = await response.json();
+    const platforms = data.platforms || [];
+    const dedicatedCount = platforms.filter(platform => platform.parser === 'dedicated').length;
+    const cookieCount = Object.values(data.cookies || {}).filter(Boolean).length;
+    if (summaryEl) {
+      summaryEl.innerHTML = `
+        <article><span>平台</span><strong>${platforms.length}</strong></article>
+        <article><span>专用解析器</span><strong>${dedicatedCount}</strong></article>
+        <article><span>Cookie</span><strong>${cookieCount}</strong></article>
+      `;
+    }
+    if (!el) return;
+    el.innerHTML = platforms.map(platform => `
+      <article class="platform-row compact">
+        <div>
+          <strong>${escapeHtml(platform.name)}</strong>
+          <p>${escapeHtml(platform.id)} · ${escapeHtml(platform.domains?.slice(0, 2).join(', ') || '')}</p>
+        </div>
+        <div class="platform-pills">
+          <span class="pill ${platform.parser === 'dedicated' ? 'ok' : 'muted'}">${platform.parser === 'dedicated' ? 'dedicated' : 'generic'}</span>
+          <span class="pill ${platform.requiresCookie ? 'warn' : 'muted'}">${platform.requiresCookie ? 'requires cookie' : 'optional cookie'}</span>
+          <span class="pill ${data.cookies?.[platform.id] ? 'ok' : 'muted'}">${data.cookies?.[platform.id] ? 'Cookie' : 'No Cookie'}</span>
+        </div>
+      </article>
+    `).join('');
+  } catch (error) {
+    if (el) el.innerHTML = `<p class="muted-text">状态加载失败：${escapeHtml(error.message)}</p>`;
+  }
+}
+
+loadPlatformStatus();
+
+async function loadAccountStatus() {
+  if (!accountUser) return;
+  try {
+    const payload = await fetchJson('/api/auth/status');
+    const username = payload.username || payload.user || 'local';
+    accountUser.textContent = username;
+    if (accountUsername) accountUsername.value = username;
+  } catch (error) {
+    accountUser.textContent = '未登录';
+  }
+}
+
+function setAccountMenu(open) {
+  if (!accountPopover || !accountTrigger) return;
+  accountPopover.hidden = !open;
+  accountTrigger.setAttribute('aria-expanded', String(open));
+}
+
+accountTrigger?.addEventListener('click', event => {
+  event.stopPropagation();
+  setAccountMenu(accountPopover?.hidden);
+});
+
+document.addEventListener('click', event => {
+  if (!event.target.closest('#account-menu')) setAccountMenu(false);
+});
+
+document.querySelector('#token-show')?.addEventListener('click', async () => {
+  if (!tokenBox || !accountToken) return;
+  try {
+    const payload = await fetchJson('/api/auth/token', { method: 'POST' });
+    accountToken.value = payload.token || '';
+    try { localStorage.setItem('onepickToken', payload.token || ''); } catch {}
+    tokenBox.hidden = false;
+  } catch (error) {
+    accountToken.value = error.message;
+    tokenBox.hidden = false;
+  }
+});
+
+document.querySelector('#token-copy')?.addEventListener('click', async () => {
+  if (!accountToken?.value) return;
+  await navigator.clipboard.writeText(accountToken.value);
+});
+
+document.querySelector('#account-edit')?.addEventListener('click', () => {
+  if (!accountDialog) return;
+  setAccountMenu(false);
+  accountDialog.hidden = false;
+  document.querySelector('#account-current-password')?.focus();
+});
+
+document.querySelector('#account-close')?.addEventListener('click', () => {
+  if (accountDialog) accountDialog.hidden = true;
+});
+
+accountDialog?.addEventListener('click', event => {
+  if (event.target === accountDialog) accountDialog.hidden = true;
+});
+
+accountForm?.addEventListener('submit', async event => {
+  event.preventDefault();
+  if (accountFormStatus) accountFormStatus.textContent = '保存中...';
+  const body = Object.fromEntries(new FormData(accountForm));
+  try {
+    const payload = await fetchJson('/api/auth/account', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body)
+    });
+    try { localStorage.setItem('onepickToken', payload.token || ''); } catch {}
+    if (accountFormStatus) accountFormStatus.textContent = '已保存。正在刷新登录状态...';
+    setTimeout(() => location.reload(), 500);
+  } catch (error) {
+    if (accountFormStatus) accountFormStatus.textContent = `保存失败：${error.message}`;
+  }
+});
+
+document.querySelector('#logout-button')?.addEventListener('click', async () => {
+  await fetch('/api/auth/logout', { method: 'POST' }).catch(() => {});
+  try { localStorage.removeItem('onepickToken'); } catch {}
+  location.href = '/login';
+});
+
+loadAccountStatus();
+
+presetPanel?.addEventListener('click', event => {
+  const button = event.target.closest('[data-preset]');
+  if (button) setActivePreset(button);
+});
+
+document.querySelector('#inspect-button')?.addEventListener('click', async () => {
+  result.hidden = false;
+  result.textContent = '正在诊断链接...';
+  try {
+    const payload = await (async () => {
+      const response = await fetch('/api/inspect', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ input: input.value })
+      });
+      const body = await response.json();
+      if (!response.ok) throw new Error(body.error || '诊断失败');
+      return body;
+    })();
+    renderInspect(payload);
+  } catch (error) {
+    result.innerHTML = `<div class="error-card"><strong>诊断失败</strong><p>${escapeHtml(error.message)}</p><p class="muted-text">${escapeHtml(errorAdvice(error.message))}</p></div>`;
+  }
+});

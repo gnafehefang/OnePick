@@ -1,0 +1,95 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>OnePick Tools</title>
+  <meta name="description" content="OnePick Tools - 一个聚合型工具箱，先从作品解析下载开始。" />
+  <link rel="stylesheet" href="/styles.css" />
+</head>
+<body>
+  <main class="shell">
+    <nav class="nav">
+      <a class="brand" href="/" aria-label="OnePick Tools">
+        <span class="brand-mark">1P</span>
+        <span>OnePick Tools</span>
+      </a>
+      <div class="nav-links">
+        <a href="#tools">工具</a>
+        <a href="/config">状态</a>
+        <a href="#roadmap">路线</a>
+      </div>
+    </nav>
+
+    <section class="hero">
+      <div class="hero-copy">
+        <p class="eyebrow">One place. Pick what you need.</p>
+        <h1>一个干净、顺手、可扩展的工具箱。</h1>
+        <p class="lead">先从作品解析下载开始，后续继续接入视频、音乐、壁纸、效率自动化等能力。</p>
+        <div class="hero-actions">
+          <a class="button primary" href="#parser">开始解析</a>
+          <a class="button ghost" href="/api/health" target="_blank" rel="noreferrer">服务状态</a>
+        </div>
+      </div>
+      <div class="glass-card hero-card">
+        <div class="orb"></div>
+        <p class="mini-title">MVP Focus</p>
+        <h2>作品解析下载</h2>
+        <p>支持平台识别，解析器插件化，逐步接入抖音、小红书、快手等主流平台。</p>
+      </div>
+    </section>
+
+    <section id="parser" class="panel glass-card">
+      <div class="section-head">
+        <p class="eyebrow">Media Parser</p>
+        <h2>粘贴作品链接</h2>
+        <p>支持分享文案自动提取链接。当前版本先完成架构和识别，真实下载解析器下一步接入。</p>
+      </div>
+      <form id="parse-form" class="parse-form">
+        <textarea id="input" name="input" rows="5" placeholder="粘贴抖音 / 小红书 / 快手等分享内容，例如：https://v.douyin.com/..." required></textarea>
+        <div class="form-actions"><button class="button primary" type="submit">一键解析</button><button class="button ghost" id="inspect-button" type="button">诊断链接</button></div>
+      </form>
+      <div id="result" class="result" hidden></div>
+    </section>
+
+    <section id="tools" class="tool-grid">
+      <article class="glass-card tool-card active">
+        <span class="icon">↓</span>
+        <h3>作品解析下载</h3>
+        <p>视频、图集、音乐、壁纸解析下载。插件化接入平台。</p>
+      </article>
+      <article class="glass-card tool-card muted">
+        <span class="icon">✦</span>
+        <h3>AI 辅助工具</h3>
+        <p>后续可接入文案、摘要、自动化处理。</p>
+      </article>
+      <article class="glass-card tool-card muted">
+        <span class="icon">⌘</span>
+        <h3>效率小工具</h3>
+        <p>格式转换、批量处理、运营辅助能力。</p>
+      </article>
+    </section>
+
+    <section class="panel glass-card compact-panel">
+      <div class="section-head">
+        <p class="eyebrow">Live Status</p>
+        <h2>平台状态</h2>
+        <p>实时读取 parser 和 Cookie 配置。需要提升成功率时，优先补对应平台 Cookie。</p>
+      </div>
+      <div id="platform-status" class="platform-list mini"></div>
+    </section>
+
+    <section id="roadmap" class="roadmap glass-card">
+      <p class="eyebrow">Roadmap</p>
+      <h2>下一步</h2>
+      <ol>
+        <li>接入抖音解析器：短链还原、作品详情、无水印媒体地址。</li>
+        <li>接入小红书解析器：图文、视频、Live 图。</li>
+        <li>接入快手解析器与批量下载。</li>
+        <li>增加账号、任务历史、打包下载和后台队列。</li>
+      </ol>
+    </section>
+  </main>
+  <script src="/app.js" type="module"></script>
+</body>
+</html>

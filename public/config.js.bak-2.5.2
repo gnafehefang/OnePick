@@ -1,0 +1,214 @@
+const statusEl = document.querySelector('#status');
+const platformsEl = document.querySelector('#platforms');
+const historyEl = document.querySelector('#history');
+let runtimeCache = null;
+
+function escapeHtml(value = '') {
+  return String(value).replace(/[&<>'"]/g, char => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', "'": '&#39;', '"': '&quot;' }[char]));
+}
+
+function pill(value, okLabel = '已配置', noLabel = '未配置') {
+  return `<span class="pill ${value ? 'ok' : 'muted'}">${value ? okLabel : noLabel}</span>`;
+}
+
+async function main() {
+  statusEl.innerHTML = '<p class="muted-text">加载中...</p>';
+  const response = await fetch('/api/runtime');
+  const data = await response.json();
+  runtimeCache = data;
+  statusEl.innerHTML = `
+    <article class="status-card"><span>服务</span><strong>${escapeHtml(data.service)}</strong></article>
+    <article class="status-card"><span>版本</span><strong>${escapeHtml(data.version)}</strong></article>
+    <article class="status-card"><span>Node</span><strong>${escapeHtml(data.node)}</strong></article>
+    <article class="status-card"><span>yt-dlp</span><strong>${escapeHtml(data.tools?.ytDlp || '未检测到')}</strong></article>
+    <article class="status-card"><span>ffmpeg</span><strong>${escapeHtml(data.tools?.ffmpeg || '未检测到')}</strong></article>
+    <article class="status-card"><span>Cookie 目录</span><strong>${escapeHtml(data.cookieDir)}</strong></article>
+    <article class="status-card"><span>代理</span><strong>${data.proxy?.enabled ? escapeHtml(data.proxy.urlMasked || '已启用') : '未启用'}</strong></article>
+  `;
+
+  platformsEl.insertAdjacentHTML('beforebegin', `
+    <div id="proxy-panel" class="cookie-help-panel">
+      <strong>代理维护</strong>
+      <p>用于 yt-dlp 解析/下载（尤其 YouTube）。支持 http/https/socks5，例如 <code>socks5://127.0.0.1:7890</code>。当前：${data.proxy?.enabled ? escapeHtml(data.proxy.urlMasked || '已启用') : '未启用'}</p>
+      <div class="form-actions inline-actions">
+        <input id="proxy-url" class="proxy-input" type="text" autocomplete="off" placeholder="socks5://127.0.0.1:7890" />
+        <button class="mini-button" id="proxy-save">保存/启用代理</button>
+        <button class="mini-button danger" id="proxy-delete">清除代理</button>
+      </div>
+      <p class="muted-text" id="proxy-status"></p>
+    </div>
+    <div id="cookie-help-panel" class="cookie-help-panel">
+      <strong>Cookie 维护</strong>
+      <p>点击每个平台右侧的“添加 Cookie / 更新 Cookie”即可写入 cookies.txt；页面不会回显已有 Cookie。</p>
+    </div>
+  `);
+  platformsEl.innerHTML = (data.platforms || []).map(platform => `
+    <article class="platform-row">
+      <div>
+        <strong>${escapeHtml(platform.name)}</strong>
+        <p>${escapeHtml(platform.id)} · ${escapeHtml(platform.parser || 'generic')}</p>
+      </div>
+      <div class="platform-pills">
+        ${pill(platform.parser === 'dedicated', 'dedicated', 'generic')}
+        ${pill(data.cookies?.[platform.id])}
+        <button class="mini-button" data-cookie-edit="${escapeHtml(platform.id)}">${data.cookies?.[platform.id] ? '更新 Cookie' : '添加 Cookie'}</button>
+        ${data.cookies?.[platform.id] ? `<button class="mini-button" data-cookie-check="${escapeHtml(platform.id)}">检查</button><button class="mini-button danger" data-cookie-delete="${escapeHtml(platform.id)}">删除</button>` : ''}
+      </div>
+    </article>
+  `).join('');
+
+  if (historyEl) {
+    const historyResponse = await fetch('/api/history?limit=20');
+    const history = await historyResponse.json();
+    const entries = history.entries || [];
+    historyEl.innerHTML = entries.length ? entries.map(entry => `
+      <article class="history-row ${entry.ok ? 'ok' : 'fail'}">
+        <div>
+          <strong>${entry.ok ? '成功' : '失败'} · ${escapeHtml(entry.kind || 'parse')}</strong>
+          <p>${escapeHtml(entry.platform || 'unknown')} · ${escapeHtml(entry.title || entry.sourceUrl || entry.error || '')}</p>
+        </div>
+        <div class="history-meta">
+          <span>${escapeHtml(entry.durationMs || 0)}ms</span>
+          <span>${escapeHtml(entry.ts || '')}</span>
+        </div>
+      </article>
+    `).join('') : '<p class="muted-text">暂无记录。</p>';
+  }
+
+  document.querySelector('#proxy-save')?.addEventListener('click', saveProxy);
+  document.querySelector('#proxy-delete')?.addEventListener('click', deleteProxy);
+
+  document.querySelectorAll('[data-cookie-edit]').forEach(button => {
+    button.addEventListener('click', () => openCookieEditor(button.dataset.cookieEdit));
+  });
+  document.querySelectorAll('[data-cookie-delete]').forEach(button => {
+    button.addEventListener('click', () => deleteCookie(button.dataset.cookieDelete));
+  });
+  document.querySelectorAll('[data-cookie-check]').forEach(button => {
+    button.addEventListener('click', () => checkCookie(button.dataset.cookieCheck));
+  });
+}
+
+
+async function saveProxy() {
+  const input = document.querySelector('#proxy-url');
+  const status = document.querySelector('#proxy-status');
+  const url = input?.value?.trim() || '';
+  if (!url) { status.textContent = '请先填写代理地址。'; return; }
+  status.textContent = '保存中...';
+  try {
+    const response = await fetch('/api/proxy', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ url, enabled: true })
+    });
+    const payload = await response.json().catch(() => ({}));
+    if (!response.ok) throw new Error(payload.error || '保存失败');
+    status.textContent = `已启用：${payload.proxy?.urlMasked || 'proxy'}`;
+    setTimeout(() => location.reload(), 600);
+  } catch (error) {
+    status.textContent = `保存失败：${error.message}`;
+  }
+}
+
+async function deleteProxy() {
+  if (!confirm('确定清除 OnePick 代理配置？')) return;
+  const status = document.querySelector('#proxy-status');
+  status.textContent = '清除中...';
+  try {
+    const response = await fetch('/api/proxy', { method: 'DELETE' });
+    const payload = await response.json().catch(() => ({}));
+    if (!response.ok) throw new Error(payload.error || '清除失败');
+    status.textContent = '已清除代理配置。';
+    setTimeout(() => location.reload(), 600);
+  } catch (error) {
+    status.textContent = `清除失败：${error.message}`;
+  }
+}
+
+function ensureCookieEditor() {
+  let editor = document.querySelector('#cookie-editor');
+  if (editor) return editor;
+  editor = document.createElement('section');
+  editor.id = 'cookie-editor';
+  editor.className = 'cookie-editor glass-card';
+  editor.innerHTML = `
+    <div class="cookie-editor-head">
+      <div>
+        <p class="eyebrow">Cookie Manager</p>
+        <h2 id="cookie-editor-title">维护 Cookie</h2>
+      </div>
+      <button class="mini-button" id="cookie-editor-close">关闭</button>
+    </div>
+    <p class="muted-text">粘贴 Netscape cookies.txt 内容。为了安全，页面不会读取或展示已有 Cookie，只能覆盖更新或删除。</p>
+    <textarea id="cookie-editor-text" spellcheck="false" placeholder="# Netscape HTTP Cookie File\n.example.com\tTRUE\t/\tTRUE\t...\tname\tvalue"></textarea>
+    <div class="form-actions">
+      <button class="button primary" id="cookie-editor-save">保存 Cookie</button>
+      <button class="button ghost" id="cookie-editor-cancel">取消</button>
+    </div>
+    <p class="muted-text" id="cookie-editor-status"></p>
+  `;
+  document.body.appendChild(editor);
+  editor.querySelector('#cookie-editor-close').addEventListener('click', closeCookieEditor);
+  editor.querySelector('#cookie-editor-cancel').addEventListener('click', closeCookieEditor);
+  editor.querySelector('#cookie-editor-save').addEventListener('click', saveCookie);
+  return editor;
+}
+
+function openCookieEditor(platformId) {
+  const editor = ensureCookieEditor();
+  editor.dataset.platform = platformId;
+  editor.querySelector('#cookie-editor-title').textContent = `维护 ${platformId}.txt`;
+  editor.querySelector('#cookie-editor-text').value = '';
+  editor.querySelector('#cookie-editor-status').textContent = '';
+  editor.classList.add('open');
+  editor.querySelector('#cookie-editor-text').focus();
+}
+
+function closeCookieEditor() {
+  document.querySelector('#cookie-editor')?.classList.remove('open');
+}
+
+async function saveCookie() {
+  const editor = ensureCookieEditor();
+  const platformId = editor.dataset.platform;
+  const text = editor.querySelector('#cookie-editor-text').value;
+  const status = editor.querySelector('#cookie-editor-status');
+  status.textContent = '保存中...';
+  try {
+    const response = await fetch(`/api/cookies/${encodeURIComponent(platformId)}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'text/plain' },
+      body: text
+    });
+    const payload = await response.json();
+    if (!response.ok) throw new Error(payload.error || '保存失败');
+    status.textContent = `已保存：${payload.bytes} bytes`;
+    setTimeout(() => location.reload(), 600);
+  } catch (error) {
+    status.textContent = `保存失败：${error.message}`;
+  }
+}
+
+async function checkCookie(platformId) {
+  const response = await fetch(`/api/cookies/${encodeURIComponent(platformId)}/check`);
+  const payload = await response.json().catch(() => ({}));
+  if (!response.ok) { alert(payload.error || '检查失败'); return; }
+  const important = payload.important ? Object.entries(payload.important).map(([k,v]) => `${k}: ${v ? '✓' : '✗'}`).join('\n') : '';
+  alert(`${platformId} Cookie 检查\n有效条目：${payload.validLines || 0}\n无效条目：${payload.invalidLines || 0}\n总 Cookie：${payload.count || 0}${important ? '\n\n关键字段：\n' + important : ''}${payload.hint ? '\n\n提示：' + payload.hint : ''}`);
+}
+
+async function deleteCookie(platformId) {
+  if (!confirm(`确定删除 ${platformId}.txt？会自动保留 .bak 备份。`)) return;
+  const response = await fetch(`/api/cookies/${encodeURIComponent(platformId)}`, { method: 'DELETE' });
+  const payload = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    alert(payload.error || '删除失败');
+    return;
+  }
+  location.reload();
+}
+
+main().catch(error => {
+  statusEl.innerHTML = `<p class="muted-text">加载失败：${escapeHtml(error.message)}</p>`;
+});

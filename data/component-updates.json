@@ -1,0 +1,7 @@
+{
+  "hour": 2,
+  "components": {
+    "ytdlp": true,
+    "ffmpeg": true
+  }
+}

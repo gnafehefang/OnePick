@@ -1,0 +1,152 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>OnePick Tools</title>
+  <meta name="description" content="OnePick Tools - 粘贴一个或多个主流站点作品链接，按预设解析、诊断、下载和打包媒体文件。" />
+  <link rel="stylesheet" href="/styles.css?v=1.5.5" />
+</head>
+<body>
+  <main class="shell">
+    <nav class="nav">
+      <a class="brand" href="/" aria-label="OnePick Tools">
+        <span class="brand-mark">1P</span>
+        <span>OnePick Tools</span>
+      </a>
+      <div class="nav-links">
+        <a href="#parser">解析</a>
+        <a href="#platforms">平台</a>
+        <a href="/config">状态</a>
+        <div class="account-menu" id="account-menu">
+          <button class="account-trigger" id="account-trigger" type="button" aria-expanded="false" aria-controls="account-popover">账户</button>
+          <section class="account-popover" id="account-popover" hidden>
+            <div class="account-head">
+              <span>当前用户</span>
+              <strong id="account-user">加载中</strong>
+            </div>
+            <div class="account-actions">
+              <button class="mini-button" id="token-show" type="button">查看 token</button>
+              <button class="mini-button" id="account-edit" type="button">修改用户名/密码</button>
+              <button class="mini-button danger" id="logout-button" type="button">登出</button>
+            </div>
+            <div class="token-box" id="token-box" hidden>
+              <textarea id="account-token" readonly></textarea>
+              <button class="mini-button" id="token-copy" type="button">复制 token</button>
+            </div>
+          </section>
+        </div>
+      </div>
+    </nav>
+
+    <section id="parser" class="workbench">
+      <div class="workbench-main panel">
+        <div class="section-head command-head">
+          <div>
+            <p class="eyebrow">OnePick Downloader</p>
+            <h1>媒体解析工作台</h1>
+            <p>粘贴单个作品链接，或一次粘贴多行分享文案。队列、预设、诊断和打包都在这里完成。</p>
+          </div>
+          <a class="button ghost compact" href="/config">Cookie / 代理</a>
+        </div>
+        <form id="parse-form" class="parse-form">
+          <label class="input-label" for="input">链接输入</label>
+          <textarea id="input" name="input" rows="7" placeholder="粘贴 YouTube / 抖音 / 小红书 / Bilibili / Vimeo 等作品链接；多行会自动批量解析。" required></textarea>
+          <div class="parse-toolbar">
+            <div>
+              <span class="toolbar-label">输出预设</span>
+              <div id="preset-panel" class="preset-panel" aria-label="输出预设">
+                <button class="preset-button active" type="button" data-preset="best" data-mode="video" data-quality="best" aria-pressed="true">自动</button>
+                <button class="preset-button" type="button" data-preset="2160" data-mode="video" data-quality="2160" aria-pressed="false">4K</button>
+                <button class="preset-button" type="button" data-preset="1440" data-mode="video" data-quality="1440" aria-pressed="false">1440</button>
+                <button class="preset-button" type="button" data-preset="1080" data-mode="video" data-quality="1080" aria-pressed="false">1080</button>
+                <button class="preset-button" type="button" data-preset="720" data-mode="video" data-quality="720" aria-pressed="false">720</button>
+                <button class="preset-button" type="button" data-preset="480" data-mode="video" data-quality="480" aria-pressed="false">480</button>
+                <button class="preset-button" type="button" data-preset="360" data-mode="video" data-quality="360" aria-pressed="false">360</button>
+                <button class="preset-button" type="button" data-preset="audio" data-mode="audio" data-quality="best" aria-pressed="false">音频</button>
+              </div>
+            </div>
+            <div class="form-actions"><button class="button primary" type="submit">解析</button><button class="button ghost" id="inspect-button" type="button">诊断</button></div>
+          </div>
+        </form>
+        <div id="result" class="result" hidden></div>
+      </div>
+      <aside class="workbench-side">
+        <section class="panel runtime-card">
+          <div class="side-title">
+            <p class="eyebrow">Live Runtime</p>
+            <h2>运行状态</h2>
+          </div>
+          <div id="runtime-summary" class="runtime-summary">
+            <article><span>平台</span><strong>加载中</strong></article>
+            <article><span>专用解析器</span><strong>加载中</strong></article>
+            <article><span>Cookie</span><strong>加载中</strong></article>
+          </div>
+          <p class="muted-text">优先专用解析器；未专用平台走 yt-dlp 通用解析。</p>
+        </section>
+        <section class="panel tips-card">
+          <p class="eyebrow">Workflow</p>
+          <ol>
+            <li>选预设</li>
+            <li>粘贴链接</li>
+            <li>失败项重试或诊断</li>
+            <li>成功项统一打包</li>
+          </ol>
+        </section>
+      </aside>
+    </section>
+
+    <section id="tools" class="tool-grid">
+      <article class="tool-card active">
+        <span class="icon">↓</span>
+        <h3>解析下载</h3>
+        <p>视频、图集、音频和可公开访问媒体解析下载。专用解析器优先，通用解析兜底。</p>
+      </article>
+      <article class="tool-card muted">
+        <span class="icon">?</span>
+        <h3>链接诊断</h3>
+        <p>识别平台、重定向链路、主页误贴、登录/验证码等常见失败原因。</p>
+      </article>
+      <article class="tool-card muted">
+        <span class="icon">HQ</span>
+        <h3>输出预设</h3>
+        <p>解析前选择自动最佳、清晰度上限或仅音频，批量队列会沿用同一套预设。</p>
+      </article>
+      <article class="tool-card muted">
+        <span class="icon">ZIP</span>
+        <h3>队列打包</h3>
+        <p>多行链接自动逐项解析，失败项可单独重试，成功结果可统一归档为 ZIP。</p>
+      </article>
+    </section>
+
+    <section id="platforms" class="panel compact-panel">
+      <div class="section-head stack-head">
+        <p class="eyebrow">Live Status</p>
+        <h2>支持平台</h2>
+        <p>实时读取 parser 和 Cookie 配置。需要提升成功率时，优先补对应平台 Cookie 或代理。</p>
+      </div>
+      <div id="platform-status" class="platform-list mini"></div>
+    </section>
+  </main>
+  <section class="account-dialog" id="account-dialog" hidden>
+    <form class="account-dialog-card" id="account-form">
+      <div class="cookie-editor-head">
+        <div>
+          <p class="eyebrow">Account</p>
+          <h2>修改用户名/密码</h2>
+        </div>
+        <button class="mini-button" id="account-close" type="button">关闭</button>
+      </div>
+      <label for="account-username">用户名</label>
+      <input id="account-username" name="username" autocomplete="username" required />
+      <label for="account-current-password">当前密码</label>
+      <input id="account-current-password" name="currentPassword" type="password" autocomplete="current-password" required />
+      <label for="account-new-password">新密码</label>
+      <input id="account-new-password" name="newPassword" type="password" autocomplete="new-password" minlength="8" required />
+      <button class="button primary" type="submit">保存并重新登录</button>
+      <p class="muted-text" id="account-form-status"></p>
+    </form>
+  </section>
+  <script src="/app.js?v=1.5.5" type="module"></script>
+</body>
+</html>

@@ -1,0 +1,83 @@
+# OnePick Tools
+
+OnePick Tools is a Docker-deployed media toolbox. Current focus: parse shared media links, proxy single-file downloads, and archive multi-item results into ZIP files.
+
+## Deploy
+
+```bash
+cd /opt/docker/onepick
+docker compose up -d --build --force-recreate
+```
+
+Default exposed port:
+
+```text
+http://<dev-host>:3877
+```
+
+## Pages
+
+- `/` — main parser UI
+- `/config` — runtime status, parser status, Cookie status, recent history
+
+## APIs
+
+- `GET /api/health`
+- `GET /api/runtime`
+- `GET /api/self-test`
+- `GET /api/tools`
+- `GET /api/history?limit=50`
+- `POST /api/inspect`
+- `POST /api/parse`
+- `GET /api/download?url=...&filename=...`
+- `POST /api/archive`
+
+## Cookies
+
+Put Netscape-format cookies here when a platform requires login/captcha bypass:
+
+```text
+cookies/douyin.txt
+cookies/xiaohongshu.txt
+cookies/kuaishou.txt
+```
+
+The directory is mounted read-only into the container at `/app/cookies`.
+
+## Data
+
+Runtime history is persisted in:
+
+```text
+data/history.jsonl
+```
+
+It is trimmed by `HISTORY_MAX_LINES` in `docker-compose.yml`.
+
+## Self test
+
+From the host:
+
+```bash
+curl -fsS http://127.0.0.1:3877/api/self-test | python3 -m json.tool
+```
+
+From inside the container/project:
+
+```bash
+ONEPICK_URL=http://127.0.0.1:3000 npm run self-test
+```
+
+From host against published port:
+
+```bash
+ONEPICK_URL=http://127.0.0.1:3877 docker compose exec onepick-tools npm run self-test
+```
+
+## Current dedicated parsers
+
+- Douyin
+- Xiaohongshu
+- Kuaishou
+
+Generic fallback uses `yt-dlp`.

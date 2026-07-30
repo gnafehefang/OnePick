@@ -1,0 +1,186 @@
+const form = document.querySelector('#parse-form');
+const input = document.querySelector('#input');
+const result = document.querySelector('#result');
+
+function escapeHtml(value = '') {
+  return String(value).replace(/[&<>'"]/g, char => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', "'": '&#39;', '"': '&quot;' }[char]));
+}
+
+function errorAdvice(message = '') {
+  if (/抖音接口仍拒绝|web detail API|a_bogus|msToken|Fresh cookies/i.test(message)) {
+    return '建议：当前已不是 Cookie 保存格式问题，而是抖音接口风控/签名环境问题。下一步需要接入浏览器抓包或 a_bogus/msToken 签名方案；不要再反复只更新 Cookie。';
+  }
+  if (/登录态已存在|没有从这个笔记提取到可下载媒体/i.test(message)) return '建议：这次不是 Cookie 没配；需要补小红书专用解析/浏览器抓包逻辑，或先换另一个公开视频笔记验证。';
+  if (/YouTube Cookie 已检测到|Requested format is not available|storyboard/i.test(message)) return '建议：Cookie 文件已存在，但 YouTube 只返回缩略图格式，说明当前登录态/账号/代理仍被风控。请重新从能正常播放该视频的浏览器导出完整 YouTube cookies.txt，或更换代理出口。';
+  if (/youtube|Sign in to confirm you.re not a bot|not a bot/i.test(message)) return '建议：这类 YouTube 风控通常需要 Cookie + 可用代理。请到 /config 查看 YouTube Cookie，并在“代理维护”里配置 http/socks5 代理后重试。';
+  if (/cookie|验证码|登录|bot|Sign in/i.test(message)) return '建议：打开 /config 查看 Cookie 状态，给对应平台配置 cookies.txt 后重试。';
+  if (/主页|首页|用户链接|不是作品/i.test(message)) return '建议：请复制具体作品/笔记/视频的分享链接，而不是主页链接。';
+  if (/Unsupported URL|暂未解析/i.test(message)) return '建议：确认链接公开可访问；若仍失败，后续需要专用解析器或 Cookie。';
+  if (/没有识别到有效链接/i.test(message)) return '建议：粘贴完整分享文案也可以，我会自动提取里面的 http/https 链接。';
+  return '建议：换一个公开作品链接重试，或到 /config 查看最近错误。';
+}
+
+function formatBytes(bytes) {
+  if (!bytes) return '';
+  const units = ['B', 'KB', 'MB', 'GB'];
+  let value = Number(bytes);
+  let index = 0;
+  while (value >= 1024 && index < units.length - 1) { value /= 1024; index += 1; }
+  return `${value.toFixed(index ? 1 : 0)} ${units[index]}`;
+}
+
+function renderItems(items = []) {
+  if (!items.length) return '<p class="muted-text">没有找到可下载媒体地址。</p>';
+  const archiveButton = items.length > 1 ? `<button class="button primary archive-button" type="button" data-archive="1">一键打包 ZIP</button>` : '';
+  return `${archiveButton}<div class="download-list">${items.map((item, index) => `
+    <article class="download-item">
+      <div>
+        <strong>${escapeHtml(item.filename || `media-${index + 1}`)}</strong>
+        <p>${escapeHtml(item.type || 'media')} ${item.height ? ` · ${item.height}p` : ''} ${item.filesize ? ` · ${formatBytes(item.filesize)}` : ''}</p>
+      </div>
+      <div class="download-actions">
+        <a class="button small" href="/api/download?url=${encodeURIComponent(item.url)}&filename=${encodeURIComponent(item.filename || `media-${index + 1}`)}">下载</a>
+        <a class="button small ghost" href="${escapeHtml(item.url)}" target="_blank" rel="noreferrer">源地址</a>
+      </div>
+    </article>
+  `).join('')}</div>`;
+}
+
+function renderInspect(payload) {
+  result.hidden = false;
+  const flags = payload.flags?.length ? payload.flags.map(flag => `<li>${escapeHtml(flag)}</li>`).join('') : '<li>未发现明显问题</li>';
+  result.innerHTML = `
+    <div class="inspect-card">
+      <p class="eyebrow">Inspect · ${escapeHtml(payload.platform?.name || '未知平台')}</p>
+      <h3>链接诊断完成</h3>
+      <p><strong>提取链接：</strong><a href="${escapeHtml(payload.extractedUrl)}" target="_blank" rel="noreferrer">${escapeHtml(payload.extractedUrl)}</a></p>
+      <p><strong>最终链接：</strong><a href="${escapeHtml(payload.finalUrl)}" target="_blank" rel="noreferrer">${escapeHtml(payload.finalUrl)}</a></p>
+      <p><strong>重定向次数：</strong>${escapeHtml(payload.redirectChain?.length || 0)} · ${escapeHtml(payload.durationMs || 0)}ms</p>
+      <ul>${flags}</ul>
+      <details><summary>查看诊断 JSON</summary><pre>${escapeHtml(JSON.stringify(payload, null, 2))}</pre></details>
+    </div>
+  `;
+}
+
+function renderResult(payload) {
+  result.hidden = false;
+  lastItems = Array.isArray(payload.items) ? payload.items : [];
+  const platformName = payload.platform?.name || '未知平台';
+  result.innerHTML = `
+    <div class="result-head">
+      ${payload.cover ? `<img src="${escapeHtml(payload.cover)}" alt="cover" />` : '<div class="cover-placeholder">1P</div>'}
+      <div>
+        <p class="eyebrow">${escapeHtml(platformName)} · ${escapeHtml(payload.engine || 'parser')}</p>
+        <h3>${escapeHtml(payload.title || '解析结果')}</h3>
+        <p><strong>标题：</strong>${escapeHtml(payload.title || '未命名作品')}</p>
+        <p class="muted-text">${escapeHtml([payload.author ? `作者：${payload.author}` : '', payload.duration ? `时长：${payload.duration}s` : ''].filter(Boolean).join(' · '))}</p>
+      </div>
+    </div>
+    ${renderItems(payload.items)}
+    <details>
+      <summary>查看原始 JSON</summary>
+      <pre>${escapeHtml(JSON.stringify(payload, null, 2))}</pre>
+    </details>
+  `;
+}
+
+let lastItems = [];
+
+
+form?.addEventListener('submit', async (event) => {
+  event.preventDefault();
+  result.hidden = false;
+  result.textContent = '正在解析，第一次可能会稍慢...';
+  try {
+    const response = await fetch('/api/parse', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ input: input.value })
+    });
+    const payload = await response.json();
+    if (!response.ok) throw new Error(payload.error || '请求失败');
+    renderResult(payload);
+  } catch (error) {
+    result.innerHTML = `<div class="error-card"><strong>解析失败</strong><p>${escapeHtml(error.message)}</p><p class="muted-text">${escapeHtml(errorAdvice(error.message))}</p><a class="button small ghost" href="/config">查看状态 / 最近错误</a></div>`;
+  }
+});
+
+
+result?.addEventListener('click', async (event) => {
+  const button = event.target.closest('[data-archive]');
+  if (!button) return;
+  if (!lastItems.length) return;
+  button.disabled = true;
+  button.textContent = '正在打包...';
+  try {
+    const response = await fetch('/api/archive', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        filename: (document.querySelector('.result-head h3')?.textContent || 'onepick-downloads') + '.zip',
+        items: lastItems.map(item => ({ url: item.url, filename: item.filename }))
+      })
+    });
+    if (!response.ok) {
+      const payload = await response.json().catch(() => ({}));
+      throw new Error(payload.error || '打包失败');
+    }
+    const blob = await response.blob();
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = (document.querySelector('.result-head h3')?.textContent || 'onepick-downloads') + '.zip';
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(url);
+  } catch (error) {
+    alert(error.message);
+  } finally {
+    button.disabled = false;
+    button.textContent = '一键打包 ZIP';
+  }
+});
+
+
+async function loadPlatformStatus() {
+  const el = document.querySelector('#platform-status');
+  if (!el) return;
+  try {
+    const response = await fetch('/api/runtime');
+    const data = await response.json();
+    el.innerHTML = (data.platforms || []).slice(0, 9).map(platform => `
+      <article class="platform-row compact">
+        <div>
+          <strong>${escapeHtml(platform.name)}</strong>
+          <p>${escapeHtml(platform.id)} · ${escapeHtml(platform.parser || 'generic')}</p>
+        </div>
+        <div class="platform-pills">
+          <span class="pill ${platform.parser === 'dedicated' ? 'ok' : 'muted'}">${platform.parser === 'dedicated' ? 'dedicated' : 'generic'}</span>
+          <span class="pill ${data.cookies?.[platform.id] ? 'ok' : 'muted'}">${data.cookies?.[platform.id] ? 'Cookie' : 'No Cookie'}</span>
+        </div>
+      </article>
+    `).join('');
+  } catch (error) {
+    el.innerHTML = `<p class="muted-text">状态加载失败：${escapeHtml(error.message)}</p>`;
+  }
+}
+
+loadPlatformStatus();
+
+document.querySelector('#inspect-button')?.addEventListener('click', async () => {
+  result.hidden = false;
+  result.textContent = '正在诊断链接...';
+  try {
+    const response = await fetch('/api/inspect', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ input: input.value })
+    });
+    const payload = await response.json();
+    if (!response.ok) throw new Error(payload.error || '诊断失败');
+    renderInspect(payload);
+  } catch (error) {
+    result.innerHTML = `<div class="error-card"><strong>诊断失败</strong><p>${escapeHtml(error.message)}</p><p class="muted-text">${escapeHtml(errorAdvice(error.message))}</p></div>`;
+  }
+});
