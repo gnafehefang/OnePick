@@ -1,6 +1,7 @@
 // ytdlp-parser.js — 通用 yt-dlp 平台解析器工厂
 // 所有走 yt-dlp 的平台复用它，保证解析→下载走同一 yt-dlp 通路。
 import { parseWithYtDlp, buildParseResponse, getCookieArgs, hasCookieFile, normalizeParsePreferences } from './shared.js';
+import { withRuntimeCookieArgs } from '../youtube-cookie-store.js';
 import { ytdlpExtraArgs, normalizePlatformUrl } from './ytdlp-platforms.js';
 
 // 各平台风控/登录态错误的统一识别 + 中文提示
@@ -52,14 +53,17 @@ export function makeYtDlpParser(platformId, opts = {}) {
     const cookieArgs = getCookieArgs(platformId);
     const extraArgs = ytdlpExtraArgs(platformId);
     const cookieAndExtra = [...cookieArgs, ...extraArgs];
+    const parseWithCookieArgs = run => platformId === 'youtube'
+      ? withRuntimeCookieArgs('youtube', runtimeArgs => run([...runtimeArgs, ...extraArgs]))
+      : run(cookieAndExtra);
     // 限流类错误自动退避重试；YouTube 带 Cookie 时默认不要裸 Cookie 重试，避免把本来需要登录态的视频误导成 bot-check。
     async function parseWithRetry() {
       try {
-        return await parseWithYtDlp(dlUrl, cookieAndExtra, resolvedPreferences, platformId);
+        return await parseWithCookieArgs(args => parseWithYtDlp(dlUrl, args, resolvedPreferences, platformId));
       } catch (err) {
         if (isRateLimited(err.message)) {
           await new Promise(r => setTimeout(r, 6000));
-          return await parseWithYtDlp(dlUrl, cookieAndExtra, resolvedPreferences, platformId);
+          return await parseWithCookieArgs(args => parseWithYtDlp(dlUrl, args, resolvedPreferences, platformId));
         }
         if (platformId === 'youtube' && cookieArgs.length && /cookie file|cookies file|invalid cookies|failed to parse cookies/i.test(err.message || '')) {
           try { return await parseWithYtDlp(dlUrl, extraArgs, resolvedPreferences, platformId); } catch {}
