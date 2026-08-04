@@ -759,7 +759,7 @@ function inspectCookieFile(platformId) {
   const important = Object.fromEntries((importantCookieNames[platformId] || []).map(name => [name, names.includes(name)]));
   const missingImportant = Object.entries(important).filter(([, ok]) => !ok).map(([name]) => name);
   const hint = platformId === 'youtube' && missingImportant.length ? 'YouTube Cookie 已保存但可能不完整：缺少部分登录态字段。若仍 bot-check，请从已登录且能正常播放该视频的浏览器重新导出完整 cookies.txt。' : '';
-  return { exists: true, count: names.length, validLines, invalidLines, domains: [...new Set(domains)].sort(), names, important, hint };
+  return { exists: true, count: names.length, validLines, invalidLines, domains: [...new Set(domains)].sort(), names, important, missingImportant, hint };
 }
 
 app.get('/api/cookies/:platform/check', (req, res, next) => {
