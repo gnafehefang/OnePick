@@ -48,6 +48,18 @@ assert.equal(status.sha256, promotion.sha256, 'master status hash must identify 
 assert.equal(fs.existsSync(paths.candidate), false, 'candidate must be removed after validation');
 
 const masterBeforeRuntime = fs.readFileSync(paths.master, 'utf8');
+await withRuntimeCookieArgs('youtube', async () => {
+  fs.writeFileSync(paths.master, incomplete, { mode: 0o600 });
+}, { cookieDir: root });
+assert.equal(fs.readFileSync(paths.master, 'utf8'), masterBeforeRuntime, 'runtime callback must not be able to leave master mutated');
+
+fs.writeFileSync(paths.master, incomplete, { mode: 0o600 });
+assert.equal(activeYoutubeMasterPath(root), '', 'master whose content changes after verification must be rejected');
+await withRuntimeCookieArgs('youtube', async args => {
+  assert.deepEqual(args, [], 'a changed master must never be passed to yt-dlp');
+}, { cookieDir: root });
+fs.writeFileSync(paths.master, masterBeforeRuntime, { mode: 0o600 });
+
 let firstRuntime = '';
 await withRuntimeCookieArgs('youtube', async (args, runtimePath) => {
   assert.deepEqual(args, ['--cookies', runtimePath]);

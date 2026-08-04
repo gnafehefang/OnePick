@@ -1838,6 +1838,9 @@ async function streamYtDlpDownload({ sourceUrl, filename, preferences, req, res,
       fs.rmSync(tempDir, { recursive: true, force: true });
     }
   } catch (error) {
+    let failedPlatform = '';
+    try { failedPlatform = detectPlatform(sourceUrl).id; } catch {}
+    appendHistory({ kind: 'ytdlp', ok: false, durationMs: Date.now() - started, processDurationMs: Date.now() - started, platform: failedPlatform || undefined, sourceUrl, error: error.message });
     if (res.headersSent) {
       res.destroy(error);
       return;

@@ -117,19 +117,42 @@ export async function promoteYoutubeCandidate(content, {
   return { promoted: true, summary, sha256, master: paths.master, candidate: candidatePath };
 }
 
+function appendMasterIntegrityAudit(cookieDir, beforeSha256, afterSha256) {
+  const entry = {
+    at: new Date().toISOString(),
+    actor: 'runtime-integrity-guard',
+    action: 'restore-master',
+    platform: 'youtube',
+    outcome: 'restored-hash-mismatch',
+    before: { sha256: beforeSha256 },
+    after: { sha256: afterSha256 },
+    reason: '运行时 Cookie 副本回调意外改写了 master，已自动恢复已验证版本。'
+  };
+  try { fs.appendFileSync(path.join(cookieDir, 'cookie-sync-audit.jsonl'), `${JSON.stringify(entry)}${os.EOL}`, { mode: 0o600 }); } catch {}
+}
+
 export async function withRuntimeCookieArgs(platformId, callback, {
   cookieDir = process.env.COOKIE_DIR || '/app/cookies'
 } = {}) {
   if (String(platformId) !== 'youtube') return callback([], '');
   const master = activeYoutubeMasterPath(cookieDir);
   if (!master) return callback([], '');
+  const masterContent = fs.readFileSync(master, 'utf8');
+  const masterSha256 = crypto.createHash('sha256').update(masterContent).digest('hex');
   const runtimeDir = fs.mkdtempSync(path.join(os.tmpdir(), 'onepick-youtube-cookie-'));
   const runtimePath = path.join(runtimeDir, 'cookies.txt');
   try {
-    fs.copyFileSync(master, runtimePath);
-    fs.chmodSync(runtimePath, 0o600);
+    fs.writeFileSync(runtimePath, masterContent, { mode: 0o600 });
     return await callback(['--cookies', runtimePath], runtimePath);
   } finally {
+    try {
+      const current = fs.readFileSync(master, 'utf8');
+      const currentSha256 = crypto.createHash('sha256').update(current).digest('hex');
+      if (currentSha256 !== masterSha256) {
+        atomicWrite(master, masterContent);
+        appendMasterIntegrityAudit(cookieDir, currentSha256, masterSha256);
+      }
+    } catch {}
     fs.rmSync(runtimeDir, { recursive: true, force: true });
   }
 }
