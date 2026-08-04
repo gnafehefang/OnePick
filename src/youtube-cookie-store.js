@@ -65,11 +65,28 @@ export function activeYoutubeMasterPath(cookieDir = process.env.COOKIE_DIR || '/
   }
 }
 
+function normalizeYoutubeCookieContent(text = '') {
+  const kept = [];
+  const seen = new Set();
+  for (const line of String(text).split(/\r?\n/)) {
+    if (!line) continue;
+    if (line.startsWith('#')) { if (!kept.length) kept.push('# Netscape HTTP Cookie File'); continue; }
+    const parts = line.split('\t');
+    if (parts.length < 7) continue;
+    const key = `${parts[0]}\t${parts[1]}\t${parts[2]}\t${parts[5]}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    kept.push(line);
+  }
+  return `${kept.join('\n')}\n`;
+}
+
 export async function promoteYoutubeCandidate(content, {
   cookieDir = process.env.COOKIE_DIR || '/app/cookies',
   validate,
   source = 'unknown'
 } = {}) {
+  content = normalizeYoutubeCookieContent(content);
   const summary = inspectYoutubeCookieText(content);
   if (!summary.complete) {
     const error = new Error(`YouTube Cookie 候选缺少关键登录态：${summary.missing.join(', ')}`);

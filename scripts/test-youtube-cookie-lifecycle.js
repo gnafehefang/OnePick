@@ -47,6 +47,14 @@ assert.equal(status.promotionSource, 'cookiecloud', 'master status must record p
 assert.equal(status.sha256, promotion.sha256, 'master status hash must identify the promoted content');
 assert.equal(fs.existsSync(paths.candidate), false, 'candidate must be removed after validation');
 
+const duplicated = `${complete}${line('SID')}\n${line('PREF')}\n`;
+const dedupRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'onepick-youtube-dedup-test-'));
+try {
+  const dedupPromotion = await promoteYoutubeCandidate(duplicated, { cookieDir: dedupRoot, validate: async () => ({ ok: true }) });
+  assert.equal(dedupPromotion.summary.count, required.length + 1, 'promotion must deduplicate repeated CookieCloud rows before validation and master write');
+  assert.equal(inspectYoutubeCookieText(fs.readFileSync(youtubeCookiePaths(dedupRoot).master, 'utf8')).count, required.length + 1);
+} finally { fs.rmSync(dedupRoot, { recursive: true, force: true }); }
+
 const masterBeforeRuntime = fs.readFileSync(paths.master, 'utf8');
 await withRuntimeCookieArgs('youtube', async () => {
   fs.writeFileSync(paths.master, incomplete, { mode: 0o600 });
