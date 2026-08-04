@@ -1699,6 +1699,15 @@ function ytdlpShortcutFormatSelector(preferences = {}) {
   return `bv*[height<=${height}][ext=mp4][vcodec^=avc1]+ba[ext=m4a]/bv*[height<=${height}][ext=mp4]+ba[ext=m4a]/b[height<=${height}][ext=mp4]/b[height<=${height}]/b[ext=mp4]/b`;
 }
 
+function ytdlpShortcutFormatSelectorForPlatform(preferences = {}, platformId = '') {
+  const prefs = normalizeParsePreferences(preferences);
+  if (String(platformId) !== 'facebook' || prefs.mode === 'audio') return ytdlpShortcutFormatSelector(prefs);
+  const height = ['best', 'worst'].includes(prefs.quality) ? '' : `[height<=${Number(prefs.quality)}]`;
+  const video = prefs.quality === 'worst' ? 'wv*' : 'bv*';
+  const audio = prefs.quality === 'worst' ? 'wa' : 'ba';
+  return `${video}${height}[ext=mp4][vcodec^=avc1]+${audio}[ext=m4a]/b${height}[ext=mp4][vcodec^=avc1]/${video}${height}[ext=mp4]+${audio}[ext=m4a]/b${height}[ext=mp4]/b`;
+}
+
 function ytdlpFileDownloadArgs(sourceUrl = '', preferences = {}, outputTemplate = '', platformId = 'youtube', cookieArgs = null) {
   const prefs = normalizeParsePreferences(preferences);
   const args = [
@@ -1710,7 +1719,7 @@ function ytdlpFileDownloadArgs(sourceUrl = '', preferences = {}, outputTemplate 
     '--force-overwrites',
     '--concurrent-fragments', '8',
     '--http-chunk-size', '10M',
-    '-f', ytdlpShortcutFormatSelector(prefs),
+    '-f', ytdlpShortcutFormatSelectorForPlatform(prefs, platformId),
     '-o', outputTemplate,
   ];
   if (prefs.mode === 'audio') args.push('--extract-audio', '--audio-format', 'm4a');
@@ -1735,9 +1744,30 @@ function isGenericYtDlpSource(sourceUrl = '') {
   }
 }
 
+async function ensureIosCompatibleShortcutVideo(inputPath, tempDir) {
+  const { stdout } = await execFileAsync('ffprobe', [
+    '-v', 'error', '-show_entries', 'stream=codec_type,codec_name,pix_fmt', '-of', 'json', inputPath
+  ], { cwd: path.join(__dirname, '..'), timeout: 15000, maxBuffer: 256 * 1024 });
+  const streams = JSON.parse(stdout || '{}')?.streams || [];
+  const video = streams.find(stream => stream.codec_type === 'video') || {};
+  const audio = streams.find(stream => stream.codec_type === 'audio');
+  const videoCompatible = video.codec_name === 'h264' && (!video.pix_fmt || video.pix_fmt === 'yuv420p');
+  const audioCompatible = !audio || audio.codec_name === 'aac';
+  if (videoCompatible && audioCompatible) return inputPath;
+  const compatiblePath = path.join(tempDir, 'ios-compatible.mp4');
+  await execFileAsync('ffmpeg', [
+    '-hide_banner', '-y', '-i', inputPath,
+    '-map', '0:v:0', '-map', '0:a?',
+    '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '20', '-pix_fmt', 'yuv420p',
+    '-c:a', 'aac', '-b:a', '128k', '-movflags', '+faststart',
+    compatiblePath
+  ], { cwd: path.join(__dirname, '..'), timeout: 120000, maxBuffer: 2 * 1024 * 1024 });
+  return compatiblePath;
+}
+
 // 下载 yt-dlp 源到临时文件，返回 { path, tempDir, extension }。调用方负责 fs.rmSync(tempDir)。
 // stream 下载与 zip 打包共用，保证两条路径行为一致。
-async function downloadYtDlpToFile(sourceUrl, preferences) {
+async function downloadYtDlpToFile(sourceUrl, preferences, { iosCompatible = false } = {}) {
   await assertPublicUrl(sourceUrl);
   const platform = detectPlatform(sourceUrl);
   const ytdlpPlatformId = YTDLP_PLATFORMS.has(platform.id) ? platform.id : (isGenericYtDlpSource(sourceUrl) ? 'generic' : '');
@@ -1784,8 +1814,11 @@ async function downloadYtDlpToFile(sourceUrl, preferences) {
         throw error;
       }
     }
-    // iOS Photos uses the MP4 creation_time tag for its album ordering. yt-dlp outputs
-    // frequently retain the source publish time, so normalize every shortcut video at download time.
+    // iOS Photos requires an actually supported video codec, not merely an MP4 container.
+    // Prefer H.264 at selection time and transcode only when a yt-dlp result is still AV1/VP9/etc.
+    if (prefs.mode !== 'audio' && iosCompatible) {
+      streamPath = await runLimitedMp4Normalization(() => ensureIosCompatibleShortcutVideo(streamPath, tempDir));
+    }
     if (prefs.mode !== 'audio') {
       const datedPath = path.join(tempDir, 'downloaded-now.mp4');
       const creationTime = new Date().toISOString();
@@ -1812,7 +1845,7 @@ async function downloadYtDlpToFile(sourceUrl, preferences) {
   }
 }
 
-async function streamYtDlpDownload({ sourceUrl, filename, preferences, req, res, next }) {
+async function streamYtDlpDownload({ sourceUrl, filename, preferences, req, res, next, iosCompatible = false }) {
   const started = Date.now();
   try {
     if (!sourceUrl) {
@@ -1824,7 +1857,7 @@ async function streamYtDlpDownload({ sourceUrl, filename, preferences, req, res,
     const platform = detectPlatform(sourceUrl);
     const extension = prefs.mode === 'audio' ? 'm4a' : 'mp4';
     const safeFilename = safeDownloadName(filename || `${platform.id}-${Date.now()}.${extension}`).replace(/\.[^.]+$/, `.${extension}`);
-    const { path: streamPath, tempDir } = await downloadYtDlpToFile(sourceUrl, prefs);
+    const { path: streamPath, tempDir } = await downloadYtDlpToFile(sourceUrl, prefs, { iosCompatible });
     try {
       res.setHeader('Content-Type', prefs.mode === 'audio' ? 'audio/mp4' : 'video/mp4');
       res.setHeader('Content-Length', String(fs.statSync(streamPath).size));
@@ -1894,6 +1927,11 @@ async function streamRemoteDownload({ targetUrl, filename, platform, req, res, n
     if (isTwitterMp4Download(targetUrl, cookiePlatform || platform, contentType, filename)) {
       try {
         await runLimitedMp4Normalization(() => streamMp4WithDownloadCreationTime({ upstream, filename, res, controller }));
+        appendHistory({
+          kind: 'remote-download', ok: true, durationMs: Date.now() - started, processDurationMs: Date.now() - started,
+          platform: 'twitter', title: safeDownloadName(resolvedFilename), sourceUrl: targetUrl,
+          clientMeta, trigger: clientMeta?.trigger || undefined
+        });
       } finally {
         stopDeadline();
         controller.abort();
@@ -2113,14 +2151,13 @@ async function sendShortcutDownload({ input, preferences, itemIndex, started, re
   res.setHeader('X-OnePick-Item-Count', String(Array.isArray(parsed.items) ? parsed.items.length : 1));
   res.setHeader('X-OnePick-Platform', String(parsed.platform?.id || item.platform || 'unknown'));
   res.setHeader('X-OnePick-Selected-Filename', encodeURIComponent(filename));
-  appendHistory({ kind: 'shortcut', ok: true, durationMs: Date.now() - started, processDurationMs: Date.now() - started, mediaDuration: parsed.duration || null, platform: parsed.platform?.id, parser: parsed.parser || parsed.engine, title: parsed.title, sourceUrl: parsed.sourceUrl || input, itemCount: Array.isArray(parsed.items) ? parsed.items.length : 1 });
 
   if (String(item.url).startsWith('/api/ytdlp-download')) {
     const shortcutUrl = new URL(item.url, 'http://127.0.0.1');
     const sourceUrl = shortcutUrl.searchParams.get('source') || '';
     const proxyFilename = shortcutUrl.searchParams.get('filename') || filename;
     const proxyPreferences = normalizeParsePreferences({ mode: shortcutUrl.searchParams.get('mode') || preferences.mode, quality: shortcutUrl.searchParams.get('quality') || preferences.quality });
-    await streamYtDlpDownload({ sourceUrl, filename: proxyFilename, preferences: proxyPreferences, req, res, next });
+    await streamYtDlpDownload({ sourceUrl, filename: proxyFilename, preferences: proxyPreferences, req, res, next, iosCompatible: true });
     return;
   }
 

@@ -10,7 +10,7 @@ const execFileAsync = promisify(execFile);
 
 export const PLATFORM_PATTERNS = [
   { id: 'douyin', name: '抖音', domains: ['douyin.com', 'iesdouyin.com'] },
-  { id: 'xiaohongshu', name: '小红书', domains: ['xiaohongshu.com', 'xhslink.com'] },
+  { id: 'xiaohongshu', name: '小红书', domains: ['xiaohongshu.com', 'xhslink.com', 'xhslink.cn'] },
   { id: 'kuaishou', name: '快手', domains: ['kuaishou.com', 'chenzhongtech.com', 'gifshow.com'] },
   { id: 'bilibili', name: 'Bilibili', domains: ['bilibili.com', 'b23.tv'] },
   { id: 'weibo', name: '微博', domains: ['weibo.com', 'weibo.cn'] },
@@ -24,9 +24,9 @@ export const PLATFORM_PATTERNS = [
 ];
 
 // 短链域名：这些域名本身不代表平台，需先跟随重定向拿到真实 URL 再判平台。
-// t.cn=新浪微博通用短链；b23.tv=B站；xhslink.com=小红书；v.douyin.com=抖音；
+// t.cn=新浪微博通用短链；b23.tv=B站；xhslink.com/.cn=小红书；v.douyin.com=抖音；
 // vm/vt.tiktok.com=TikTok；fb.watch=FB；pin.it=Pinterest；youtu.be=YT。
-export const SHORTLINK_DOMAINS = ['t.cn', 'b23.tv', 'xhslink.com', 'v.douyin.com', 'vm.tiktok.com', 'vt.tiktok.com', 'dwz.cn', 'suo.im', 'pin.it', 'fb.watch', 'youtu.be'];
+export const SHORTLINK_DOMAINS = ['t.cn', 'b23.tv', 'xhslink.com', 'xhslink.cn', 'v.douyin.com', 'vm.tiktok.com', 'vt.tiktok.com', 'dwz.cn', 'suo.im', 'pin.it', 'fb.watch', 'youtu.be'];
 
 export function isShortLink(url) {
   try {
