@@ -11,6 +11,7 @@
 
 import crypto from 'node:crypto';
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 
 const DATA_DIR = process.env.DATA_DIR || '/app/data';
@@ -330,14 +331,39 @@ export function clearCookieCloudConfig() {
  * @param {string}  opts.cookieDir        cookies directory (created if missing)
  * @returns {Promise<{synced:Array, skipped:Array}>}
  */
+export function appendCookieSyncAudit(cookieDir, entry = {}) {
+  const filePath = path.join(cookieDir, 'cookie-sync-audit.jsonl');
+  const safe = {
+    at: new Date().toISOString(),
+    actor: String(entry.actor || 'unknown').slice(0, 80),
+    action: String(entry.action || 'sync').slice(0, 80),
+    platform: String(entry.platform || '').slice(0, 80),
+    outcome: String(entry.outcome || '').slice(0, 80),
+    before: entry.before || null,
+    incoming: entry.incoming || null,
+    after: entry.after || null,
+    reason: entry.reason ? String(entry.reason).slice(0, 500) : null
+  };
+  fs.appendFileSync(filePath, `${JSON.stringify(safe)}${os.EOL}`, { mode: 0o600 });
+}
+
+export function readCookieSyncAudit(cookieDir, limit = 100) {
+  const filePath = path.join(cookieDir, 'cookie-sync-audit.jsonl');
+  try {
+    return fs.readFileSync(filePath, 'utf8').trim().split(/\r?\n/).filter(Boolean)
+      .slice(-Math.max(1, Math.min(Number(limit) || 100, 500))).map(line => JSON.parse(line));
+  } catch { return []; }
+}
+
 export async function syncCookieCloudToFiles({
   config,
   platformDomainMap,
   cookieToNetscapeLine,
   cookieFilePath,
-  cookieDir
+  cookieDir,
+  fetchCookieCloudFn = fetchCookieCloud
 }) {
-  const parsed = await fetchCookieCloud(config);
+  const parsed = await fetchCookieCloudFn(config);
   const cookieData = parsed && parsed.cookie_data ? parsed.cookie_data : {};
   const byPlatform = mapCookiesToPlatforms(cookieData, platformDomainMap);
 
@@ -362,10 +388,16 @@ export async function syncCookieCloudToFiles({
       continue;
     }
     const content = ['# Netscape HTTP Cookie File', ...lines].join('\n') + '\n';
+    const incoming = platformId === 'youtube'
+      ? { count: lines.length, complete: cookieLinesCompleteForPlatform(platformId, lines), missing: YOUTUBE_REQUIRED_COOKIE_NAMES.filter(name => !new Set(lines.map(line => String(line).split('\t')[5])).has(name)) }
+      : { count: lines.length };
+    const before = platformId === 'youtube' ? cookieFileSummary(filePath, platformId) : null;
     try {
       if (existingCookieFileMoreComplete(platformId, filePath, lines)) {
         const summary = cookieFileSummary(filePath, platformId);
-        skipped.push({ platform: platformId, reason: '新同步的 YouTube Cookie 缺关键登录态，已保留本地较完整 cookie 文件。', count: lines.length, kept: summary });
+        const reason = '新同步的 YouTube Cookie 缺关键登录态，已保留本地较完整 cookie 文件。';
+        skipped.push({ platform: platformId, reason, count: lines.length, kept: summary });
+        appendCookieSyncAudit(cookieDir, { actor: 'cookiecloud', action: 'write-candidate', platform: platformId, outcome: 'rejected-kept-existing', before, incoming, after: summary, reason });
         continue;
       }
       if (fs.existsSync(filePath)) {
@@ -374,8 +406,11 @@ export async function syncCookieCloudToFiles({
       fs.writeFileSync(filePath, content, { mode: 0o600 });
       const summary = cookieFileSummary(filePath, platformId);
       synced.push({ platform: platformId, count: lines.length, complete: summary.complete, domains: summary.domains, missing: summary.missing });
+      appendCookieSyncAudit(cookieDir, { actor: 'cookiecloud', action: 'write-candidate', platform: platformId, outcome: 'written', before, incoming, after: summary });
     } catch (error) {
-      skipped.push({ platform: platformId, reason: `写入失败：${error.message}` });
+      const reason = `写入失败：${error.message}`;
+      skipped.push({ platform: platformId, reason });
+      appendCookieSyncAudit(cookieDir, { actor: 'cookiecloud', action: 'write-candidate', platform: platformId, outcome: 'write-failed', before, incoming, reason });
     }
   }
 

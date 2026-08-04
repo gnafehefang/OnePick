@@ -4,12 +4,16 @@
 // Run: node scripts/test-cookiecloud.js
 
 import assert from 'node:assert';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import {
   cookieCloudKeyMaterial,
   cryptoJsAesEncrypt,
   decryptCookieCloud,
   mapCookiesToPlatforms,
-  buildPlatformDomainMap
+  buildPlatformDomainMap,
+  syncCookieCloudToFiles
 } from '../src/cookiecloud.js';
 import { PLATFORM_PATTERNS } from '../src/parsers/shared.js';
 
@@ -97,5 +101,24 @@ check('deterministic vector with fixed salt decrypts', () => {
   const dec = decryptCookieCloud(uuid, password, enc);
   assert.deepStrictEqual(dec, { cookie_data: {} });
 });
+
+const auditRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'onepick-cookiecloud-audit-'));
+try {
+  await syncCookieCloudToFiles({
+    config: {}, platformDomainMap: domainMap,
+    cookieToNetscapeLine: cookie => `.youtube.com\tTRUE\t/\tTRUE\t0\t${cookie.name}\t${cookie.value}`,
+    cookieFilePath: id => path.join(auditRoot, `${id}.txt`), cookieDir: auditRoot,
+    fetchCookieCloudFn: async () => ({ cookie_data: { 'youtube.com': [{ name: 'SID', value: 'masked', domain: '.youtube.com' }] } })
+  });
+  const audit = fs.readFileSync(path.join(auditRoot, 'cookie-sync-audit.jsonl'), 'utf8').trim().split('\n').map(JSON.parse);
+  assert.deepStrictEqual(audit[0], {
+    at: audit[0].at, actor: 'cookiecloud', action: 'write-candidate', platform: 'youtube', outcome: 'written',
+    before: { count: 0, domains: [], complete: false, missing: ['SID','HSID','SSID','APISID','SAPISID','__Secure-1PSID','__Secure-3PSID','LOGIN_INFO'] },
+    incoming: { count: 1, complete: false, missing: ['HSID','SSID','APISID','SAPISID','__Secure-1PSID','__Secure-3PSID','LOGIN_INFO'] },
+    after: { count: 1, domains: ['.youtube.com'], complete: false, missing: ['HSID','SSID','APISID','SAPISID','__Secure-1PSID','__Secure-3PSID','LOGIN_INFO'] }, reason: null
+  });
+  passed += 1;
+  console.log('  ✓ sync writes a redacted forensic audit record');
+} finally { fs.rmSync(auditRoot, { recursive: true, force: true }); }
 
 console.log(`\nALL ${passed} CHECKS PASSED`);

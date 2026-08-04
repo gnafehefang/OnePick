@@ -16,7 +16,7 @@ import { promisify } from 'node:util';
 import { parseMedia, listSupportedPlatforms, extractFirstUrl, detectPlatform } from './parsers/index.js';
 import { assertPublicUrl, fetchPublicUrl, getCookieStatus, resolveRedirects, getCookieHeader, assertCookieForDownload, getDownloadCookieRequirementStatus, requiresCookieForDownload, getProxyStatus, getProxyConfig, validateProxyUrl, proxyConfigPath, getProxyArgs, normalizeParsePreferences, PLATFORM_PATTERNS, getPlatformProxyModes, defaultProxyModeForPlatform, shouldUseProxyForPlatform, downloadCookiePlatformForUrl, mediaRequestHeaders, hostMatchesDomain } from './parsers/shared.js';
 import { YTDLP_PLATFORMS, ytdlpDownloadExtraArgs } from './parsers/ytdlp-platforms.js';
-import { readCookieCloudConfig, writeCookieCloudConfig, clearCookieCloudConfig, syncCookieCloudToFiles, buildPlatformDomainMap, fetchCookieCloud } from './cookiecloud.js';
+import { readCookieCloudConfig, writeCookieCloudConfig, clearCookieCloudConfig, syncCookieCloudToFiles, buildPlatformDomainMap, fetchCookieCloud, appendCookieSyncAudit, readCookieSyncAudit } from './cookiecloud.js';
 import { promoteYoutubeCandidate, withRuntimeCookieArgs, activeYoutubeMasterPath, inspectYoutubeCookieText, youtubeCookiePaths, YOUTUBE_REQUIRED_COOKIE_NAMES } from './youtube-cookie-store.js';
 
 const __filename = fileURLToPath(import.meta.url);
@@ -798,13 +798,19 @@ async function checkYoutubeCookieConfiguration() {
     const promoted = await promoteYoutubeCandidate(content, {
       cookieDir: cookieDirPath(), validate: validateYoutubeCookieCandidate, source: 'manual-check'
     });
+    appendCookieSyncAudit(cookieDirPath(), { actor: 'manual-ui', action: 'check-promote-master', platform: 'youtube', outcome: 'validated-promoted', incoming: { count: promoted.summary.count, complete: true }, after: { count: promoted.summary.count, complete: true } });
     runtimePayloadCache = null;
     return { ok: true, state: youtubeCookieRuntimeStatus(), count: promoted.summary.count };
   } catch (error) {
+    appendCookieSyncAudit(cookieDirPath(), { actor: 'manual-ui', action: 'check-promote-master', platform: 'youtube', outcome: 'validation-failed', reason: error.errorClass || error.message });
     runtimePayloadCache = null;
     return { ok: false, state: youtubeCookieRuntimeStatus(), error: error.message, errorClass: error.errorClass || 'validation-error' };
   }
 }
+
+app.get('/api/cookies/youtube/audit', (req, res) => {
+  res.json({ ok: true, entries: readCookieSyncAudit(cookieDirPath(), req.query?.limit) });
+});
 
 app.get('/api/cookies/:platform/check', async (req, res, next) => {
   try {
@@ -865,6 +871,7 @@ app.post('/api/cookies/:platform', async (req, res, next) => {
         validate: validateYoutubeCookieCandidate,
         source: 'manual-api'
       });
+      appendCookieSyncAudit(cookieDirPath(), { actor: 'manual-api', action: 'promote-master', platform: platformId, outcome: 'validated-promoted', incoming: { count: promoted.summary.count, complete: true }, after: { count: promoted.summary.count, complete: true } });
       appendHistory({ kind: 'cookie', ok: true, platform: platformId, title: 'validated cookie promoted' });
       res.json({ ok: true, platform: platformId, configured: true, validated: true, count: promoted.summary.count });
       return;
@@ -876,6 +883,7 @@ app.post('/api/cookies/:platform', async (req, res, next) => {
     appendHistory({ kind: 'cookie', ok: true, platform: platformId, title: 'cookie updated' });
     res.json({ ok: true, platform: platformId, configured: true, bytes: Buffer.byteLength(content) });
   } catch (error) {
+    if (String(req.params.platform || '') === 'youtube') appendCookieSyncAudit(cookieDirPath(), { actor: 'manual-api', action: 'promote-master', platform: 'youtube', outcome: 'validation-failed', reason: error.errorClass || error.message });
     appendHistory({ kind: 'cookie', ok: false, platform: req.params.platform, error: error.message });
     next(error);
   }
@@ -1242,8 +1250,10 @@ async function runCookieCloudSync(config) {
         source: 'cookiecloud'
       });
       result.youtubePromotion = { ok: true, count: promoted.summary.count, sha256: promoted.sha256 };
+      appendCookieSyncAudit(cookieDirPath(), { actor: 'cookiecloud', action: 'promote-master', platform: 'youtube', outcome: 'validated-promoted', incoming: { count: promoted.summary.count, complete: true }, after: { count: promoted.summary.count, complete: true } });
     } catch (error) {
       result.youtubePromotion = { ok: false, errorClass: error.errorClass || 'validation-error', error: error.message };
+      appendCookieSyncAudit(cookieDirPath(), { actor: 'cookiecloud', action: 'promote-master', platform: 'youtube', outcome: 'validation-failed', reason: error.errorClass || error.message });
       result.skipped.push({ platform: 'youtube', reason: error.message });
       result.synced = result.synced.filter(item => item.platform !== 'youtube');
     }
