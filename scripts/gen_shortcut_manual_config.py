@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# OnePick Shortcut v16: use plain-text input and normalize HTTP media before Photos import.
+# OnePick Shortcut v17: share/clipboard plain-text input, signed distribution artifact, and direct Photos import.
 import plistlib, uuid
 from pathlib import Path
 
@@ -25,7 +25,7 @@ def alert(msg): return action("is.workflow.actions.alert",{"WFAlertActionTitle":
 VIBRATE=action("is.workflow.actions.vibrate")
 EXIT=action("is.workflow.actions.exit")
 A=[]
-A.append(comment("OnePick 视频下载 v16\n修复 iOS 上 X 下载完成后出现空白页：分享输入和剪贴板只按纯文本交给后端；响应媒体直接存入相册。\n配置：若剪贴板有 onepick-config|服务器|token 会自动使用；否则使用导入时填写的一整段。"))
+A.append(comment("OnePick 视频下载 v17\n修复 iOS/X 分享下载空白页：分享输入与剪贴板只按纯文本交给后端；响应媒体直接存入相册。\n配置：导入时粘贴 onepick-config|服务器|token；可从 OnePick 账户页复制。凭据轮换后请重新导入或更新配置。"))
 # import-time fallback config
 u_cfg=U(); cfg_idx=len(A); A.append(text(u_cfg,"onepick-config|https://onepick.download.com:8088|apikey.PASTE_TOKEN_HERE")); A.append(setv("OP_CFG",u_cfg,"文本"))
 uv=U(); A.append(text(uv,"on")); A.append(setv("OP_VIBRATE",uv,"文本"))
@@ -48,7 +48,7 @@ uurl=U(); A.append(action("is.workflow.actions.gettext",{"UUID":uurl,"WFTextActi
 unet=U(); A.append(action("is.workflow.actions.downloadurl",{"UUID":unet,"WFURL":tok_vars("\ufffc",[(0,'var',"OP_URL",None)]),"WFHTTPMethod":"POST","WFHTTPBodyType":"JSON","WFJSONValues":{"Value":{"WFDictionaryFieldValueItems":[{"WFItemType":0,"WFKey":plain("input"),"WFValue":tok_vars("\ufffc",[(0,'var',"OP_LINK",None)])}]},"WFSerializationType":"WFDictionaryFieldValue"}})); A.append(setv("OP_MEDIA",unet,"内容"))
 ut=U(); A.append(action("is.workflow.actions.gettext",{"UUID":ut,"WFTextActionText":tok_vars("\ufffc",[(0,'var',"OP_MEDIA",None)])})); A.append(setv("OP_RESP",ut,"文本"))
 gs=U(); A.append(cond(gs,"OP_RESP","\"error\"",0)); gv=U(); A.append(cond(gv,"OP_VIBRATE","on",0)); A.append(VIBRATE); A.append(VIBRATE); A.append(cond(gv,mode=2)); A.append(alert("下载失败 ⚠️\n请检查配置、链接、Cookie 或代理。")); A.append(cond(gs,mode=1)); A.append(action("is.workflow.actions.savetocameraroll",{"WFInput":var_attach("OP_MEDIA")})); gv2=U(); A.append(cond(gv2,"OP_VIBRATE","on",0)); A.append(VIBRATE); A.append(cond(gv2,mode=2)); A.append(cond(gs,mode=2))
-workflow={"WFWorkflowActions":A,"WFWorkflowClientVersion":"2607.1.3","WFWorkflowMinimumClientVersion":900,"WFWorkflowMinimumClientVersionString":"900","WFWorkflowHasOutputFallback":False,"WFWorkflowHasShortcutInputVariables":True,"WFWorkflowIcon":{"WFWorkflowIconStartColor":431817727,"WFWorkflowIconGlyphNumber":59717},"WFWorkflowImportQuestions":[{"ActionIndex":cfg_idx,"Category":"Parameter","ParameterKey":"WFTextActionText","Text":"粘贴 OnePick 配置（一整段；若剪贴板有正确配置也会自动使用）","DefaultValue":"onepick-config|https://onepick.download.com:8088|apikey.PASTE_TOKEN_HERE"}],"WFWorkflowInputContentItemClasses":["WFStringContentItem","WFURLContentItem","WFSafariWebPageContentItem","WFRichTextContentItem","WFGenericFileContentItem"],"WFWorkflowTypes":["ActionExtension","NCWidget"]}
+workflow={"WFWorkflowActions":A,"WFWorkflowClientVersion":"2607.1.3","WFWorkflowMinimumClientVersion":900,"WFWorkflowMinimumClientVersionString":"900","WFWorkflowHasOutputFallback":False,"WFWorkflowHasShortcutInputVariables":True,"WFWorkflowName":"OnePick 视频下载 v17","WFWorkflowIcon":{"WFWorkflowIconStartColor":431817727,"WFWorkflowIconGlyphNumber":59717},"WFWorkflowImportQuestions":[{"ActionIndex":cfg_idx,"Category":"Parameter","ParameterKey":"WFTextActionText","Text":"粘贴 OnePick 配置（一整段；若剪贴板有正确配置也会自动使用）","DefaultValue":"onepick-config|https://onepick.download.com:8088|apikey.PASTE_TOKEN_HERE"}],"WFWorkflowInputContentItemClasses":["WFStringContentItem","WFURLContentItem","WFSafariWebPageContentItem","WFRichTextContentItem","WFGenericFileContentItem"],"WFWorkflowTypes":["ActionExtension","NCWidget"]}
 out=Path('/tmp/onepick_import_config.shortcut')
 plistlib.dump(workflow,out.open('wb'),fmt=plistlib.FMT_XML)
 print('written',out,'actions',len(A),'cfg_idx',cfg_idx)
