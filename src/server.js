@@ -7,16 +7,17 @@ import crypto from 'node:crypto';
 import os from 'node:os';
 import { fileURLToPath } from 'node:url';
 import archiver from 'archiver';
-import { Readable } from 'node:stream';
+import { Readable, Transform } from 'node:stream';
 import http from 'node:http';
 import https from 'node:https';
 import { pipeline } from 'node:stream/promises';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { parseMedia, listSupportedPlatforms, extractFirstUrl, detectPlatform } from './parsers/index.js';
-import { assertPublicUrl, getCookieStatus, resolveRedirects, getCookieHeader, assertCookieForDownload, getDownloadCookieRequirementStatus, requiresCookieForDownload, getProxyStatus, validateProxyUrl, proxyConfigPath, getProxyArgs, normalizeParsePreferences, PLATFORM_PATTERNS, getPlatformProxyModes, defaultProxyModeForPlatform, shouldUseProxyForPlatform } from './parsers/shared.js';
+import { assertPublicUrl, fetchPublicUrl, getCookieStatus, resolveRedirects, getCookieHeader, assertCookieForDownload, getDownloadCookieRequirementStatus, requiresCookieForDownload, getProxyStatus, getProxyConfig, validateProxyUrl, proxyConfigPath, getProxyArgs, normalizeParsePreferences, PLATFORM_PATTERNS, getPlatformProxyModes, defaultProxyModeForPlatform, shouldUseProxyForPlatform, downloadCookiePlatformForUrl, mediaRequestHeaders, hostMatchesDomain } from './parsers/shared.js';
 import { YTDLP_PLATFORMS, ytdlpDownloadExtraArgs } from './parsers/ytdlp-platforms.js';
-import { readCookieCloudConfig, writeCookieCloudConfig, clearCookieCloudConfig, syncCookieCloudToFiles, buildPlatformDomainMap } from './cookiecloud.js';
+import { readCookieCloudConfig, writeCookieCloudConfig, clearCookieCloudConfig, syncCookieCloudToFiles, buildPlatformDomainMap, fetchCookieCloud } from './cookiecloud.js';
+import { promoteYoutubeCandidate, withRuntimeCookieArgs, activeYoutubeMasterPath } from './youtube-cookie-store.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -32,6 +33,12 @@ const packagePath = fs.existsSync(path.join(__dirname, 'package.json')) ? path.j
 const staticDir = fs.existsSync(path.join(__dirname, '..', 'public')) ? path.join(__dirname, '..', 'public') : __dirname;
 const packageJson = JSON.parse(fs.readFileSync(packagePath, 'utf8'));
 const appVersion = packageJson.version || '0.0.0';
+const maxRemoteDownloadBytes = Math.max(1, Number(process.env.MAX_REMOTE_DOWNLOAD_BYTES || 1024 * 1024 * 1024));
+const maxConcurrentMp4Normalization = 1;
+const maxMp4NormalizationInputBytes = Math.max(1, Number(process.env.MAX_MP4_NORMALIZATION_INPUT_BYTES || Math.floor(maxRemoteDownloadBytes / 2)));
+const maxImageProxyBytes = Math.max(1, Number(process.env.MAX_IMAGE_PROXY_BYTES || 15 * 1024 * 1024));
+const maxArchiveItems = Math.min(50, Math.max(1, Number(process.env.MAX_ARCHIVE_ITEMS || 20)));
+const maxYtDlpFileBytes = Math.max(1, Number(process.env.MAX_YTDLP_FILE_BYTES || 2 * 1024 * 1024 * 1024));
 
 const authUser = process.env.ONEPICK_AUTH_USER || 'hugh';
 const authPassword = process.env.ONEPICK_AUTH_PASSWORD || process.env.ONEPICK_ADMIN_PASSWORD || '';
@@ -52,13 +59,14 @@ function ensureDataDir() {
 function sanitizeHistoryUrl(value = '') {
   const text = String(value || '');
   try {
-    const url = new URL(text);
+    const url = text.startsWith('/') ? new URL(text, 'http://onepick.local') : new URL(text);
     for (const key of [...url.searchParams.keys()]) {
       if (/token|key|cookie|signature|sign|auth|credential/i.test(key)) url.searchParams.set(key, '***');
     }
-    return url.toString().slice(0, 500);
+    const rendered = text.startsWith('/') ? `${url.pathname}${url.search}` : url.toString();
+    return rendered.slice(0, 500);
   } catch {
-    return text.slice(0, 500);
+    return text.replace(/([?&](?:token|key|cookie|signature|sign|auth|credential)[^=&]*=)[^&\s]+/gi, '$1***').slice(0, 500);
   }
 }
 
@@ -158,8 +166,8 @@ function platformHistoryStatus() {
       const pid = entry && entry.platform;
       if (!pid) continue;
       if (!status[pid]) status[pid] = { ok: Boolean(entry.ok), ts: entry.ts || '', kind: entry.kind || 'parse', count: 0 };
-      // 成功下载次数：kind 为 download/ytdlp/archive 且 ok，且在清零基准之后
-      const isDownload = ['download', 'ytdlp', 'archive'].includes(entry.kind);
+      // 成功下载次数：浏览器油猴直链会记为 remote-download，需与 yt-dlp/archive 一并计入。
+      const isDownload = ['download', 'remote-download', 'ytdlp', 'archive'].includes(entry.kind);
       if (isDownload && entry.ok && (!resetTs || (entry.ts && entry.ts > resetTs))) {
         status[pid].count += 1;
       }
@@ -321,9 +329,13 @@ function signTokenPayload(payload) {
   return crypto.createHmac('sha256', authSecret).update(payload).digest('base64url');
 }
 
+function sessionVersion() {
+  return Number(readAuthConfig()?.sessionVersion || 0);
+}
+
 function createAuthToken(subject = currentAuthUser()) {
   const now = Math.floor(Date.now() / 1000);
-  const payload = base64url(JSON.stringify({ sub: subject, scope: 'onepick', iat: now, exp: now + authTokenTtlSeconds }));
+  const payload = base64url(JSON.stringify({ sub: subject, scope: 'onepick', sv: sessionVersion(), iat: now, exp: now + authTokenTtlSeconds }));
   return `${payload}.${signTokenPayload(payload)}`;
 }
 
@@ -372,6 +384,7 @@ function verifyAuthToken(token = '') {
   }
   const now = Math.floor(Date.now() / 1000);
   if (parsed.scope !== 'onepick' || !parsed.exp || Number(parsed.exp) < now) return null;
+  if (Number(parsed.sv || 0) !== sessionVersion()) return null;
   return parsed;
 }
 
@@ -415,10 +428,40 @@ function authCookieOptions(req) {
 
 
 app.use(helmet({ contentSecurityPolicy: false }));
-app.use(morgan('tiny'));
+app.use(morgan((tokens, req, res) => {
+  const url = sanitizeHistoryUrl(req.originalUrl || req.url || '');
+  return `${tokens['remote-addr'](req, res)} ${tokens.method(req, res)} ${url} ${tokens.status(req, res)} ${tokens.res(req, res, 'content-length') || '-'} ${tokens['response-time'](req, res)} ms`;
+}));
 app.use(express.json({ limit: '1mb' }));
-app.use(express.urlencoded({ extended: true }));
+app.use(express.urlencoded({ extended: true, limit: '1mb' }));
 app.use(express.text({ type: 'text/plain', limit: '2mb' }));
+
+const loginAttempts = new Map();
+const loginWindowMs = 15 * 60 * 1000;
+const loginMaxAttempts = 10;
+function loginAttemptKey(req, username = '') {
+  return `${String(req.socket?.remoteAddress || '').replace(/^::ffff:/, '')}|${String(username || '').trim().toLowerCase()}`;
+}
+function assertLoginRateLimit(req, username) {
+  const now = Date.now();
+  const key = loginAttemptKey(req, username);
+  const hits = (loginAttempts.get(key) || []).filter(ts => now - ts < loginWindowMs);
+  if (hits.length >= loginMaxAttempts) {
+    const error = new Error('登录尝试过于频繁，请 15 分钟后再试。');
+    error.statusCode = 429;
+    throw error;
+  }
+  loginAttempts.set(key, hits);
+}
+function recordLoginFailure(req, username) {
+  const key = loginAttemptKey(req, username);
+  const hits = (loginAttempts.get(key) || []).filter(ts => Date.now() - ts < loginWindowMs);
+  hits.push(Date.now());
+  loginAttempts.set(key, hits);
+}
+function clearLoginFailures(req, username) {
+  loginAttempts.delete(loginAttemptKey(req, username));
+}
 
 app.get('/login', (req, res) => {
   if (!authEnabled) {
@@ -435,10 +478,17 @@ app.post('/api/auth/login', (req, res) => {
   }
   const username = String(req.body?.username || '').trim();
   const password = String(req.body?.password || '');
+  try {
+    assertLoginRateLimit(req, username);
+  } catch (error) {
+    return res.status(error.statusCode || 429).json({ error: error.message });
+  }
   if (!verifyCredentials(username, password)) {
+    recordLoginFailure(req, username);
     res.status(401).json({ error: '用户名或密码不正确。' });
     return;
   }
+  clearLoginFailures(req, username);
   const token = createAuthToken(username);
   res.cookie(authCookieName, token, authCookieOptions(req));
   res.json({ ok: true, authEnabled: true, user: username, token, expiresIn: authTokenTtlSeconds });
@@ -521,9 +571,11 @@ app.post('/api/auth/account', (req, res) => {
     res.status(400).json({ error: '新密码至少需要 8 位。' });
     return;
   }
+  const previous = readAuthConfig();
   const nextConfig = {
     username: nextUsername,
     password: hashPassword(nextPassword),
+    sessionVersion: Number(previous?.sessionVersion || 0) + 1,
     updatedAt: new Date().toISOString()
   };
   writeAuthConfig(nextConfig);
@@ -687,9 +739,10 @@ const importantCookieNames = {
 };
 
 function inspectCookieFile(platformId) {
-  const filePath = cookieFilePath(platformId);
+  const filePath = platformId === 'youtube' ? activeYoutubeMasterPath(cookieDirPath()) : cookieFilePath(platformId);
   if (!fs.existsSync(filePath)) return { exists: false, count: 0, validLines: 0, invalidLines: 0, names: [], important: {} };
   const names = [];
+  const domains = [];
   let validLines = 0;
   let invalidLines = 0;
   for (const line of fs.readFileSync(filePath, 'utf8').split(/\r?\n/)) {
@@ -697,6 +750,7 @@ function inspectCookieFile(platformId) {
     const parts = line.split('\t');
     if (parts.length === 7) {
       validLines += 1;
+      domains.push(parts[0]);
       names.push(parts[5]);
     } else {
       invalidLines += 1;
@@ -705,7 +759,7 @@ function inspectCookieFile(platformId) {
   const important = Object.fromEntries((importantCookieNames[platformId] || []).map(name => [name, names.includes(name)]));
   const missingImportant = Object.entries(important).filter(([, ok]) => !ok).map(([name]) => name);
   const hint = platformId === 'youtube' && missingImportant.length ? 'YouTube Cookie 已保存但可能不完整：缺少部分登录态字段。若仍 bot-check，请从已登录且能正常播放该视频的浏览器重新导出完整 cookies.txt。' : '';
-  return { exists: true, count: names.length, validLines, invalidLines, names, important, hint }; 
+  return { exists: true, count: names.length, validLines, invalidLines, domains: [...new Set(domains)].sort(), names, important, hint };
 }
 
 app.get('/api/cookies/:platform/check', (req, res, next) => {
@@ -720,7 +774,7 @@ app.get('/api/cookies/:platform/check', (req, res, next) => {
 // Cookie 脱敏预览：返回每条 cookie 的 name=脱敏value（开头*结尾），供前端输入框背景占位展示，不回显明文
 app.get('/api/cookies/:platform/preview', (req, res, next) => {
   try {
-    const filePath = cookieFilePath(req.params.platform);
+    const filePath = String(req.params.platform) === 'youtube' ? activeYoutubeMasterPath(cookieDirPath()) : cookieFilePath(req.params.platform);
     if (!fs.existsSync(filePath)) return res.json({ ok: true, platform: req.params.platform, exists: false, preview: [] });
     const mask = (v = '') => {
       const s = String(v);
@@ -749,18 +803,28 @@ app.get('/api/cookies/:platform/preview', (req, res, next) => {
   }
 });
 
-app.post('/api/cookies/:platform', (req, res, next) => {
+app.post('/api/cookies/:platform', async (req, res, next) => {
   try {
-    const filePath = cookieFilePath(req.params.platform);
+    const platformId = String(req.params.platform || '').replace(/[^a-z0-9_-]/gi, '');
+    const filePath = cookieFilePath(platformId);
     const raw = typeof req.body === 'string' ? req.body : req.body?.content;
-    const content = validateCookieText(raw, req.params.platform);
+    const content = validateCookieText(raw, platformId);
     fs.mkdirSync(cookieDirPath(), { recursive: true });
+    if (platformId === 'youtube') {
+      const promoted = await promoteYoutubeCandidate(content, {
+        cookieDir: cookieDirPath(),
+        validate: validateYoutubeCookieCandidate
+      });
+      appendHistory({ kind: 'cookie', ok: true, platform: platformId, title: 'validated cookie promoted' });
+      res.json({ ok: true, platform: platformId, configured: true, validated: true, count: promoted.summary.count });
+      return;
+    }
     if (fs.existsSync(filePath)) {
       fs.copyFileSync(filePath, `${filePath}.bak`);
     }
     fs.writeFileSync(filePath, content, { mode: 0o600 });
-    appendHistory({ kind: 'cookie', ok: true, platform: req.params.platform, title: 'cookie updated' });
-    res.json({ ok: true, platform: req.params.platform, configured: true, bytes: Buffer.byteLength(content) });
+    appendHistory({ kind: 'cookie', ok: true, platform: platformId, title: 'cookie updated' });
+    res.json({ ok: true, platform: platformId, configured: true, bytes: Buffer.byteLength(content) });
   } catch (error) {
     appendHistory({ kind: 'cookie', ok: false, platform: req.params.platform, error: error.message });
     next(error);
@@ -769,13 +833,18 @@ app.post('/api/cookies/:platform', (req, res, next) => {
 
 app.delete('/api/cookies/:platform', (req, res, next) => {
   try {
-    const filePath = cookieFilePath(req.params.platform);
+    const platformId = String(req.params.platform || '').replace(/[^a-z0-9_-]/gi, '');
+    const filePath = platformId === 'youtube' ? activeYoutubeMasterPath(cookieDirPath()) : cookieFilePath(platformId);
     if (fs.existsSync(filePath)) {
       fs.copyFileSync(filePath, `${filePath}.bak`);
       fs.unlinkSync(filePath);
     }
-    appendHistory({ kind: 'cookie', ok: true, platform: req.params.platform, title: 'cookie deleted' });
-    res.json({ ok: true, platform: req.params.platform, configured: false });
+    if (platformId === 'youtube') {
+      const statusPath = path.join(cookieDirPath(), 'youtube.master.json');
+      fs.rmSync(statusPath, { force: true });
+    }
+    appendHistory({ kind: 'cookie', ok: true, platform: platformId, title: 'cookie deleted' });
+    res.json({ ok: true, platform: platformId, configured: false });
   } catch (error) {
     appendHistory({ kind: 'cookie', ok: false, platform: req.params.platform, error: error.message });
     next(error);
@@ -1008,7 +1077,8 @@ app.post('/api/proxy/test', async (req, res, next) => {
   try {
     const explicit = typeof req.body === 'string' ? req.body : String(req.body?.url || '');
     const status = getProxyStatus();
-    const main = explicit || status.url || '';
+    const config = getProxyConfig();
+    const main = explicit || config.url || '';
     const urls = [main, ...(Array.isArray(req.body?.backups) ? req.body.backups : [])].filter(Boolean);
     if (!urls.length) { const error = new Error('请先填写代理地址。'); error.statusCode = 400; throw error; }
     const results = [];
@@ -1093,13 +1163,118 @@ function scheduleCookieCloudSync() {
 
 async function runCookieCloudSync(config) {
   const platformDomainMap = buildPlatformDomainMap(PLATFORM_PATTERNS, manageableCookiePlatforms);
-  return syncCookieCloudToFiles({
+  const result = await syncCookieCloudToFiles({
     config: { server: config.server, uuid: config.uuid, password: config.password },
     platformDomainMap,
     cookieToNetscapeLine,
-    cookieFilePath,
+    cookieFilePath: platformId => platformId === 'youtube' ? path.join(cookieDirPath(), 'youtube.source.txt') : cookieFilePath(platformId),
     cookieDir: cookieDirPath()
   });
+  const youtubeSynced = result.synced.find(item => item.platform === 'youtube');
+  if (youtubeSynced) {
+    try {
+      const content = fs.readFileSync(path.join(cookieDirPath(), 'youtube.source.txt'), 'utf8');
+      const promoted = await promoteYoutubeCandidate(content, {
+        cookieDir: cookieDirPath(),
+        validate: validateYoutubeCookieCandidate
+      });
+      result.youtubePromotion = { ok: true, count: promoted.summary.count };
+    } catch (error) {
+      result.youtubePromotion = { ok: false, errorClass: error.errorClass || 'validation-error', error: error.message };
+      result.skipped.push({ platform: 'youtube', reason: error.message });
+      result.synced = result.synced.filter(item => item.platform !== 'youtube');
+    }
+  }
+  try { result.youtubeLocal = inspectCookieFile('youtube'); } catch {}
+  return result;
+}
+
+async function validateYoutubeCookieCandidate(candidatePath) {
+  const testUrl = process.env.YOUTUBE_COOKIE_TEST_URL || 'https://www.youtube.com/watch?v=OImbRaEk8ss';
+  const args = [
+    ...getProxyArgs('youtube'),
+    '--cookies', candidatePath,
+    '--dump-single-json', '--no-playlist', '--skip-download', '--no-warnings',
+    '--socket-timeout', '20',
+    ...ytdlpDownloadExtraArgs('youtube'),
+    testUrl
+  ];
+  try {
+    const { stdout } = await execFileAsync('yt-dlp', args, { timeout: 60000, maxBuffer: 16 * 1024 * 1024 });
+    const info = JSON.parse(stdout);
+    const formats = Array.isArray(info.formats) ? info.formats : [];
+    return { ok: Boolean(info.id && formats.some(format => format.url)) };
+  } catch (error) {
+    const detail = String(error.stderr || error.message || '');
+    const errorClass = /not a bot|LOGIN_REQUIRED|cookies are no longer valid|sign in/i.test(detail)
+      ? 'bot-check-or-login-invalid'
+      : /timed out|timeout|connection|proxy|tunnel|429/i.test(detail) ? 'network-or-egress' : 'extractor-error';
+    return { ok: false, errorClass };
+  }
+}
+
+
+function platformDomainRules(platformId = '') {
+  const map = buildPlatformDomainMap(PLATFORM_PATTERNS, manageableCookiePlatforms);
+  return map[String(platformId || '').replace(/[^a-z0-9_-]/gi, '')] || [];
+}
+
+function summarizeCookieCloudSource(cookieData = {}, platformId = '') {
+  const id = String(platformId || '').replace(/[^a-z0-9_-]/gi, '');
+  const platformDomainMap = buildPlatformDomainMap(PLATFORM_PATTERNS, new Set([id]));
+  const rules = platformDomainMap[id] || [];
+  const matchDomain = domain => {
+    const host = String(domain || '').trim().replace(/^\./, '').toLowerCase();
+    return rules.some(rule => host === String(rule).toLowerCase() || host.endsWith(`.${String(rule).toLowerCase()}`));
+  };
+  const matched = [];
+  for (const [group, cookies] of Object.entries(cookieData || {})) {
+    if (!Array.isArray(cookies)) continue;
+    for (const cookie of cookies) {
+      if (!cookie || typeof cookie !== 'object') continue;
+      const domain = cookie.domain || group;
+      if (!matchDomain(domain)) continue;
+      matched.push({ group, domain: String(domain || ''), name: String(cookie.name || cookie.key || '') });
+    }
+  }
+  const names = matched.map(c => c.name).filter(Boolean);
+  const important = Object.fromEntries((importantCookieNames[id] || []).map(name => [name, names.includes(name)]));
+  return {
+    matchedCount: matched.length,
+    domains: [...new Set(matched.map(c => c.domain).filter(Boolean))].sort(),
+    names: [...new Set(names)].sort(),
+    important,
+    cookies: matched.sort((a,b) => `${a.domain}\t${a.name}`.localeCompare(`${b.domain}\t${b.name}`)).slice(0, 300)
+  };
+}
+
+function cookieCloudServerKey(value = '') {
+  try {
+    const url = new URL(String(value || '').trim());
+    url.hash = '';
+    url.search = '';
+    url.pathname = url.pathname.replace(/\/+$/, '');
+    return url.toString().replace(/\/$/, '');
+  } catch { return ''; }
+}
+
+async function assertCookieCloudServerChange(server, existingServer = '') {
+  const next = cookieCloudServerKey(server);
+  if (!next) {
+    const error = new Error('CookieCloud server 地址格式不正确。');
+    error.statusCode = 400;
+    throw error;
+  }
+  try {
+    await assertPublicUrl(next);
+    return next;
+  } catch (error) {
+    // 兼容现有部署：已经保存的内网 CookieCloud 可继续使用；API 不允许把它改成任意其他内网目标。
+    if (existingServer && next === cookieCloudServerKey(existingServer)) return next;
+    const blocked = new Error('CookieCloud server 只允许公网地址；保留当前已配置的内网 CookieCloud 时请不要修改 server。');
+    blocked.statusCode = 400;
+    throw blocked;
+  }
 }
 
 app.get('/api/cookiecloud', (req, res) => {
@@ -1108,11 +1283,11 @@ app.get('/api/cookiecloud', (req, res) => {
 
 app.post('/api/cookiecloud', async (req, res, next) => {
   try {
-    const server = String(req.body?.server || '').trim();
+    const existing = readCookieCloudConfig();
+    const server = await assertCookieCloudServerChange(String(req.body?.server || '').trim(), existing.server);
     const uuid = String(req.body?.uuid || '').trim();
     const intervalMinutes = normalizeInterval(req.body?.intervalMinutes);
     const enabled = intervalMinutes > 0 || (req.body?.enabled === undefined ? false : Boolean(req.body?.enabled));
-    const existing = readCookieCloudConfig();
     // Keep existing password when the client sends the masked placeholder or nothing.
     const rawPassword = req.body?.password;
     const password = (rawPassword === undefined || rawPassword === null || rawPassword === '' || rawPassword === '***')
@@ -1127,9 +1302,9 @@ app.post('/api/cookiecloud', async (req, res, next) => {
       try {
         const result = await runCookieCloudSync(config);
         sync = result;
-        writeCookieCloudConfig({ ...readCookieCloudConfig(), ...config, enabled, intervalMinutes, lastSync: new Date().toISOString(), lastResult: { ok: true, synced: result.synced, skipped: result.skipped } });
+        writeCookieCloudConfig({ ...readCookieCloudConfig(), ...config, lastSync: new Date().toISOString(), lastResult: { ok: true, synced: result.synced, skipped: result.skipped } });
       } catch (error) {
-        writeCookieCloudConfig({ ...readCookieCloudConfig(), ...config, enabled, intervalMinutes, lastResult: { ok: false, error: error.message } });
+        writeCookieCloudConfig({ ...readCookieCloudConfig(), ...config, lastResult: { ok: false, error: error.message } });
         sync = { error: error.message, synced: [], skipped: [] };
       }
     }
@@ -1138,6 +1313,32 @@ app.post('/api/cookiecloud', async (req, res, next) => {
     res.json({ ok: true, ...cookieCloudPublicConfig(), enabled, intervalMinutes, sync });
   } catch (error) {
     appendHistory({ kind: 'cookiecloud', ok: false, error: error.message });
+    next(error);
+  }
+});
+
+
+app.get('/api/cookiecloud/inspect', async (req, res, next) => {
+  try {
+    let platformId = String(req.query?.platform || 'youtube').trim().toLowerCase().replace(/[^a-z0-9_-]/gi, '') || 'youtube';
+    if (!manageableCookiePlatforms.has(platformId)) {
+      if (!req.query?.platform || /^you/.test(platformId)) platformId = 'youtube';
+    }
+    if (!manageableCookiePlatforms.has(platformId)) {
+      res.status(400).json({ ok: false, error: '不支持检查该平台 CookieCloud 源头。', platform: platformId, allowed: [...manageableCookiePlatforms].sort() });
+      return;
+    }
+    const config = readCookieCloudConfig();
+    if (!config.server || !config.uuid || !config.password) {
+      res.status(400).json({ ok: false, error: '尚未配置 CookieCloud（server/uuid/password 均必填）。' });
+      return;
+    }
+    const parsed = await fetchCookieCloud({ server: config.server, uuid: config.uuid, password: config.password });
+    const cookieData = parsed && parsed.cookie_data ? parsed.cookie_data : {};
+    const source = summarizeCookieCloudSource(cookieData, platformId);
+    const local = inspectCookieFile(platformId);
+    res.json({ ok: true, platform: platformId, ruleDomains: platformDomainRules(platformId), source, local });
+  } catch (error) {
     next(error);
   }
 });
@@ -1151,11 +1352,11 @@ app.post('/api/cookiecloud/sync', async (req, res, next) => {
     }
     try {
       const result = await runCookieCloudSync(config);
-      writeCookieCloudConfig({ ...readCookieCloudConfig(), ...config, enabled, intervalMinutes, lastSync: new Date().toISOString(), lastResult: { ok: true, synced: result.synced, skipped: result.skipped } });
+      writeCookieCloudConfig({ ...readCookieCloudConfig(), ...config, lastSync: new Date().toISOString(), lastResult: { ok: true, synced: result.synced, skipped: result.skipped } });
       appendHistory({ kind: 'cookiecloud', ok: true, title: `cookiecloud sync (${result.synced.length} platforms)` });
       res.json({ ok: true, synced: result.synced, skipped: result.skipped });
     } catch (error) {
-      writeCookieCloudConfig({ ...readCookieCloudConfig(), ...config, enabled, intervalMinutes, lastResult: { ok: false, error: error.message } });
+      writeCookieCloudConfig({ ...readCookieCloudConfig(), ...config, lastResult: { ok: false, error: error.message } });
       appendHistory({ kind: 'cookiecloud', ok: false, error: error.message });
       res.status(502).json({ ok: false, error: error.message, synced: [], skipped: [] });
     }
@@ -1221,6 +1422,36 @@ function safeDownloadName(name = 'onepick-media') {
     .slice(0, 120) || 'onepick-media';
 }
 
+function parseClientMeta(value = '') {
+  try {
+    if (!value) return null;
+    const parsed = JSON.parse(Buffer.from(String(value), 'base64url').toString('utf8'));
+    if (!parsed || typeof parsed !== 'object') return null;
+    return {
+      userscriptVersion: String(parsed.userscriptVersion || '').slice(0, 32),
+      siteId: String(parsed.siteId || '').slice(0, 32),
+      siteName: String(parsed.siteName || '').slice(0, 64),
+      pageUrl: String(parsed.pageUrl || '').slice(0, 500),
+      rightClickUrl: String(parsed.rightClickUrl || '').slice(0, 500),
+      submittedUrl: String(parsed.submittedUrl || '').slice(0, 500),
+      trigger: String(parsed.trigger || '').slice(0, 64),
+      videoId: String(parsed.videoId || '').slice(0, 80),
+      mediaTitle: String(parsed.mediaTitle || '').slice(0, 120),
+      qualityPreference: String(parsed.qualityPreference || '').slice(0, 16),
+      capturedAt: String(parsed.capturedAt || '').slice(0, 64)
+    };
+  } catch { return null; }
+}
+
+function facebookVideoIdFromAny(...values) {
+  for (const v of values) {
+    const s = String(v || '');
+    const hit = s.match(/[?&]v=(\d{6,})/) || s.match(/\/(?:videos|reel)\/(\d{6,})/) || s.match(/video_id=(\d{6,})/);
+    if (hit) return hit[1];
+  }
+  return '';
+}
+
 function contentDisposition(filename) {
   const safe = safeDownloadName(filename);
   const ascii = safe.replace(/[^ -~]/g, '_').replace(/"/g, '').slice(0, 120) || 'onepick-media';
@@ -1228,18 +1459,70 @@ function contentDisposition(filename) {
   return `attachment; filename="${ascii}"; filename*=UTF-8''${encoded}`;
 }
 
-
-function downloadCookiePlatformForUrl(targetUrl = '', explicitPlatform = '') {
-  const explicit = String(explicitPlatform || '').replace(/[^a-z0-9_-]/gi, '');
-  if (requiresCookieForDownload(explicit)) return explicit;
-  try {
-    const host = new URL(targetUrl).hostname.toLowerCase();
-    if (/xiaohongshu|xhscdn|sns/i.test(host)) return 'xiaohongshu';
-    if (/kuaishou|kwaicdn|gifshow|chenzhongtech/i.test(host)) return 'kuaishou';
-    if (/x\.com|twitter\.com|twimg\.com/i.test(host)) return 'twitter';
-  } catch {}
-  return '';
+function assertContentLength(response, limit, label = '下载文件') {
+  const size = Number(response.headers.get('content-length') || 0);
+  if (Number.isFinite(size) && size > limit) {
+    const error = new Error(`${label}超过大小限制。`);
+    error.statusCode = 413;
+    throw error;
+  }
 }
+
+async function pipeLimitedResponse(response, res, limit, signal) {
+  assertContentLength(response, limit);
+  const reader = response.body?.getReader();
+  if (!reader) throw new Error('下载源没有可读内容。');
+  let total = 0;
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      total += value.byteLength;
+      if (total > limit) {
+        const error = new Error('下载文件超过大小限制。');
+        error.statusCode = 413;
+        throw error;
+      }
+      if (!res.write(Buffer.from(value))) await new Promise(resolve => res.once('drain', resolve));
+    }
+    res.end();
+  } finally {
+    if (!res.writableEnded) await reader.cancel().catch(() => {});
+    signal?.abort();
+  }
+}
+
+function createLimitedUpstreamStream(response, limit, controller, label = '下载文件') {
+  assertContentLength(response, limit, label);
+  if (!response.body) throw new Error('下载源没有可读内容。');
+  let total = 0;
+  return Readable.fromWeb(response.body).pipe(new Transform({
+    transform(chunk, _encoding, callback) {
+      total += chunk.length;
+      if (total > limit) {
+        const error = new Error(`${label}超过大小限制。`);
+        error.statusCode = 413;
+        controller?.abort();
+        callback(error);
+        return;
+      }
+      callback(null, chunk);
+    }
+  }));
+}
+
+function createUpstreamDeadline(controller, req = null, res = null) {
+  const timeout = setTimeout(() => controller.abort(), Number(process.env.REMOTE_DOWNLOAD_TIMEOUT_MS || 120000));
+  const stop = () => controller.abort();
+  req?.once('aborted', stop);
+  res?.once('close', stop);
+  return () => {
+    clearTimeout(timeout);
+    req?.off('aborted', stop);
+    res?.off('close', stop);
+  };
+}
+
 
 function enforceDownloadCookieRequirement(targetUrl = '', explicitPlatform = '') {
   const platformId = downloadCookiePlatformForUrl(targetUrl, explicitPlatform);
@@ -1248,44 +1531,7 @@ function enforceDownloadCookieRequirement(targetUrl = '', explicitPlatform = '')
 }
 
 function mediaFetchHeaders(targetUrl = '', platformId = '') {
-  const headers = {
-    'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36',
-    'Accept': 'video/webm,video/mp4,video/*,*/*',
-    'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
-    'Range': 'bytes=0-'
-  };
-  try {
-    const host = new URL(targetUrl).hostname.toLowerCase();
-    if (/douyin|douyinvod|byte/i.test(host)) {
-      headers.Referer = 'https://www.douyin.com/';
-      headers.Origin = 'https://www.douyin.com';
-    } else if (/xiaohongshu|xhscdn|sns/i.test(host)) {
-      headers.Referer = 'https://www.xiaohongshu.com/';
-      headers.Origin = 'https://www.xiaohongshu.com';
-    } else if (/kuaishou|kwaicdn|gifshow|chenzhongtech/i.test(host)) {
-      headers.Referer = 'https://www.kuaishou.com/';
-      headers.Origin = 'https://www.kuaishou.com';
-    } else if (/bilibili|bilivideo/i.test(host)) {
-      headers.Referer = 'https://www.bilibili.com/';
-      headers.Origin = 'https://www.bilibili.com';
-    } else if (/youtube|googlevideo/i.test(host)) {
-      headers.Referer = 'https://www.youtube.com/';
-      headers.Origin = 'https://www.youtube.com';
-    } else if (/weibo|sinaimg/i.test(host)) {
-      headers.Referer = 'https://weibo.com/';
-      headers.Origin = 'https://weibo.com';
-    } else if (/tiktok|tiktokcdn/i.test(host)) {
-      headers.Referer = 'https://www.tiktok.com/';
-      headers.Origin = 'https://www.tiktok.com';
-    } else if (/x\.com|twitter\.com|twimg\.com/i.test(host)) {
-      headers.Referer = 'https://x.com/';
-      headers.Origin = 'https://x.com';
-    }
-  } catch {}
-  const cookiePlatform = platformId || downloadCookiePlatformForUrl(targetUrl);
-  const cookieHeader = cookiePlatform ? getCookieHeader(cookiePlatform) : '';
-  if (cookieHeader) headers.Cookie = cookieHeader;
-  return headers;
+  return mediaRequestHeaders(targetUrl, platformId);
 }
 
 function isTwitterMp4Download(targetUrl = '', platformId = '', contentType = '', filename = '') {
@@ -1299,13 +1545,42 @@ function isTwitterMp4Download(targetUrl = '', platformId = '', contentType = '',
   return isTwitter && isMp4;
 }
 
-async function streamMp4WithDownloadCreationTime({ upstream, filename, res }) {
+function withAsyncConcurrencyLimit(maxConcurrent, taskName = '任务') {
+  let active = 0;
+  return async task => {
+    if (active >= maxConcurrent) {
+      const error = new Error(`${taskName}繁忙，请稍后重试。`);
+      error.statusCode = 429;
+      throw error;
+    }
+    active += 1;
+    try {
+      return await task();
+    } finally {
+      active -= 1;
+    }
+  };
+}
+
+const runLimitedMp4Normalization = withAsyncConcurrencyLimit(maxConcurrentMp4Normalization, 'MP4 元数据处理');
+
+function isMp4NormalizationFallbackError(error) {
+  const code = String(error?.code || '');
+  return !error?.statusCode && error?.name !== 'AbortError' && code !== '20' && code !== 'ABORT_ERR' && code !== 'ERR_STREAM_PREMATURE_CLOSE';
+}
+
+async function streamMp4WithDownloadCreationTime({ upstream, filename, res, controller }) {
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'onepick-mp4-time-'));
   const inputPath = path.join(tempDir, 'input.mp4');
   const outputPath = path.join(tempDir, 'output.mp4');
   const creationTime = new Date().toISOString();
   try {
-    await pipeline(Readable.fromWeb(upstream.body), fs.createWriteStream(inputPath));
+    await pipeline(createLimitedUpstreamStream(upstream, maxMp4NormalizationInputBytes, controller, 'MP4 文件'), fs.createWriteStream(inputPath));
+    if (fs.statSync(inputPath).size > maxMp4NormalizationInputBytes) {
+      const error = new Error('MP4 文件超过大小限制。');
+      error.statusCode = 413;
+      throw error;
+    }
     await execFileAsync('ffmpeg', [
       '-y',
       '-i', inputPath,
@@ -1315,17 +1590,23 @@ async function streamMp4WithDownloadCreationTime({ upstream, filename, res }) {
       '-metadata', `creation_time=${creationTime}`,
       '-movflags', 'use_metadata_tags+faststart',
       outputPath
-    ], { timeout: 120000, maxBuffer: 2 * 1024 * 1024 });
+    ], { timeout: 120000, maxBuffer: 2 * 1024 * 1024, signal: controller?.signal });
     res.setHeader('Content-Type', 'video/mp4');
+    if (fs.statSync(outputPath).size > maxMp4NormalizationInputBytes) {
+      const error = new Error('MP4 文件超过大小限制。');
+      error.statusCode = 413;
+      throw error;
+    }
     res.setHeader('Content-Length', String(fs.statSync(outputPath).size));
     res.setHeader('X-OnePick-Creation-Time', creationTime);
     res.setHeader('X-OnePick-Metadata-Normalized', 'creation_time');
     await pipeline(fs.createReadStream(outputPath), res);
   } catch (error) {
-    if (res.headersSent) throw error;
+    if (res.headersSent || !isMp4NormalizationFallbackError(error)) throw error;
+    // Only a compatible ffmpeg metadata failure may fall back; size limits and cancellation must fail closed.
     console.warn('Failed to normalize MP4 creation_time, serving original file:', error.message);
-    res.setHeader('Content-Type', 'video/mp4');
-    if (fs.existsSync(inputPath)) {
+    if (fs.existsSync(inputPath) && fs.statSync(inputPath).size <= maxMp4NormalizationInputBytes) {
+      res.setHeader('Content-Type', 'video/mp4');
       res.setHeader('Content-Length', String(fs.statSync(inputPath).size));
       await pipeline(fs.createReadStream(inputPath), res);
       return;
@@ -1345,11 +1626,11 @@ function ytdlpShortcutFormatSelector(preferences = {}) {
   return `bv*[height<=${height}][ext=mp4][vcodec^=avc1]+ba[ext=m4a]/bv*[height<=${height}][ext=mp4]+ba[ext=m4a]/b[height<=${height}][ext=mp4]/b[height<=${height}]/b[ext=mp4]/b`;
 }
 
-function ytdlpFileDownloadArgs(sourceUrl = '', preferences = {}, outputTemplate = '', platformId = 'youtube') {
+function ytdlpFileDownloadArgs(sourceUrl = '', preferences = {}, outputTemplate = '', platformId = 'youtube', cookieArgs = null) {
   const prefs = normalizeParsePreferences(preferences);
   const args = [
     ...getProxyArgs(platformId),
-    ...getCookieDownloadArgs(platformId),
+    ...(cookieArgs || getCookieDownloadArgs(platformId)),
     ...ytdlpDownloadExtraArgs(platformId),
     '--no-playlist',
     '--no-warnings',
@@ -1372,12 +1653,22 @@ function getCookieDownloadArgs(platformId = '') {
   return fs.existsSync(cookiePath) && fs.statSync(cookiePath).size > 0 ? ['--cookies', cookiePath] : [];
 }
 
+function isGenericYtDlpSource(sourceUrl = '') {
+  try {
+    const parsed = new URL(sourceUrl);
+    return /^https?:$/.test(parsed.protocol) && /\.m3u8(?:$|[?#])/i.test(`${parsed.pathname}${parsed.search}`);
+  } catch {
+    return false;
+  }
+}
+
 // 下载 yt-dlp 源到临时文件，返回 { path, tempDir, extension }。调用方负责 fs.rmSync(tempDir)。
 // stream 下载与 zip 打包共用，保证两条路径行为一致。
 async function downloadYtDlpToFile(sourceUrl, preferences) {
   await assertPublicUrl(sourceUrl);
   const platform = detectPlatform(sourceUrl);
-  if (!YTDLP_PLATFORMS.has(platform.id)) {
+  const ytdlpPlatformId = YTDLP_PLATFORMS.has(platform.id) ? platform.id : (isGenericYtDlpSource(sourceUrl) ? 'generic' : '');
+  if (!ytdlpPlatformId) {
     const error = new Error(`yt-dlp 下载代理不支持该平台（${platform.id}）源链接。`);
     error.statusCode = 400;
     throw error;
@@ -1387,16 +1678,21 @@ async function downloadYtDlpToFile(sourceUrl, preferences) {
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), `onepick-${platform.id}-`));
   const outputTemplate = path.join(tempDir, 'download.%(ext)s');
   try {
-    await execFileAsync('yt-dlp', ytdlpFileDownloadArgs(sourceUrl, prefs, outputTemplate, platform.id), {
-      cwd: path.join(__dirname, '..'),
-      timeout: 120000,
-      maxBuffer: 1024 * 1024
-    });
+    await withRuntimeCookieArgs(ytdlpPlatformId, cookieArgs => execFileAsync(
+      'yt-dlp',
+      ytdlpFileDownloadArgs(sourceUrl, prefs, outputTemplate, ytdlpPlatformId, ytdlpPlatformId === 'youtube' ? cookieArgs : null),
+      { cwd: path.join(__dirname, '..'), timeout: 120000, maxBuffer: 1024 * 1024 }
+    ));
     const files = fs.readdirSync(tempDir).map(name => path.join(tempDir, name));
     const outputPath = files.find(file => file.endsWith(`.${extension}`)) || files[0];
     if (!outputPath || !fs.existsSync(outputPath)) {
       const error = new Error('yt-dlp 没有生成可下载文件。');
       error.statusCode = 502;
+      throw error;
+    }
+    if (fs.statSync(outputPath).size > maxYtDlpFileBytes) {
+      const error = new Error('媒体文件超过大小限制。');
+      error.statusCode = 413;
       throw error;
     }
     let streamPath = outputPath;
@@ -1409,6 +1705,11 @@ async function downloadYtDlpToFile(sourceUrl, preferences) {
         compatiblePath
       ], { cwd: path.join(__dirname, '..'), timeout: 90000, maxBuffer: 2 * 1024 * 1024 });
       streamPath = compatiblePath;
+      if (fs.statSync(streamPath).size > maxYtDlpFileBytes) {
+        const error = new Error('媒体文件超过大小限制。');
+        error.statusCode = 413;
+        throw error;
+      }
     }
     return { path: streamPath, tempDir, extension, mode: prefs.mode };
   } catch (error) {
@@ -1437,7 +1738,8 @@ async function streamYtDlpDownload({ sourceUrl, filename, preferences, req, res,
       res.setHeader('Content-Disposition', contentDisposition(safeFilename));
       res.setHeader('Cache-Control', 'private, max-age=0, no-store');
       await pipeline(fs.createReadStream(streamPath), res);
-      appendHistory({ kind: 'ytdlp', ok: true, durationMs: Date.now() - started, processDurationMs: Date.now() - started, mediaDuration: Number(req.query?.mediaDuration || 0) || null, platform: platform.id, title: safeFilename, sourceUrl });
+      const clientMeta = parseClientMeta(req.query?.clientMeta);
+    appendHistory({ kind: 'ytdlp', ok: true, durationMs: Date.now() - started, processDurationMs: Date.now() - started, mediaDuration: Number(req.query?.mediaDuration || 0) || null, platform: platform.id, title: safeFilename, sourceUrl, clientMeta, videoId: clientMeta?.videoId || facebookVideoIdFromAny(sourceUrl) || undefined, quality: String(req.query?.quality || clientMeta?.qualityPreference || '') || undefined, trigger: clientMeta?.trigger || undefined });
     } finally {
       fs.rmSync(tempDir, { recursive: true, force: true });
     }
@@ -1451,6 +1753,7 @@ async function streamYtDlpDownload({ sourceUrl, filename, preferences, req, res,
 }
 
 async function streamRemoteDownload({ targetUrl, filename, platform, req, res, next }) {
+  const started = Date.now();
   try {
     if (!targetUrl) {
       const error = new Error('缺少 url 参数。');
@@ -1460,30 +1763,57 @@ async function streamRemoteDownload({ targetUrl, filename, platform, req, res, n
     await assertPublicUrl(targetUrl);
     const cookiePlatform = enforceDownloadCookieRequirement(targetUrl, platform);
 
-    const upstream = await fetch(targetUrl, {
-      redirect: 'follow',
-      headers: mediaFetchHeaders(targetUrl, cookiePlatform)
-    });
+    const controller = new AbortController();
+    const stopDeadline = createUpstreamDeadline(controller, req, res);
+    let upstream;
+    try {
+      upstream = await fetchPublicUrl(targetUrl, {
+        headers: mediaFetchHeaders(targetUrl, cookiePlatform),
+        signal: controller.signal
+      });
+    } catch (error) {
+      stopDeadline();
+      throw error;
+    }
 
     if (!upstream.ok || !upstream.body) {
+      stopDeadline();
       const error = new Error(`下载源返回 ${upstream.status}`);
       error.statusCode = 502;
       throw error;
     }
 
     const contentType = upstream.headers.get('content-type') || 'application/octet-stream';
-    res.setHeader('Content-Disposition', contentDisposition(filename || 'onepick-media'));
+    const clientMeta = parseClientMeta(req.query?.clientMeta);
+    let resolvedFilename = filename || 'onepick-media';
+    if (String(platform || clientMeta?.siteId || '').toLowerCase() === 'kuaishou' && clientMeta?.mediaTitle && /^(?:onepick-media|media(?:[ _-]?file)?|媒体文件)(?:\.[a-z0-9]{2,5})?$/i.test(String(resolvedFilename).trim())) {
+      const ext = String(contentType).includes('video') ? 'mp4' : 'bin';
+      resolvedFilename = `${clientMeta.mediaTitle}.${ext}`;
+    }
+    res.setHeader('Content-Disposition', contentDisposition(resolvedFilename));
     res.setHeader('Cache-Control', 'private, max-age=0, no-store');
 
+    assertContentLength(upstream, maxRemoteDownloadBytes);
     if (isTwitterMp4Download(targetUrl, cookiePlatform || platform, contentType, filename)) {
-      await streamMp4WithDownloadCreationTime({ upstream, filename, res });
+      try {
+        await runLimitedMp4Normalization(() => streamMp4WithDownloadCreationTime({ upstream, filename, res, controller }));
+      } finally {
+        stopDeadline();
+        controller.abort();
+      }
       return;
     }
 
     res.setHeader('Content-Type', contentType);
     const length = upstream.headers.get('content-length');
     if (length) res.setHeader('Content-Length', length);
-    await pipeline(Readable.fromWeb(upstream.body), res);
+    await pipeLimitedResponse(upstream, res, maxRemoteDownloadBytes, controller);
+    stopDeadline();
+    appendHistory({
+      kind: 'remote-download', ok: true, durationMs: Date.now() - started, processDurationMs: Date.now() - started,
+      platform: String((platform && platform !== 'generic' ? platform : clientMeta?.siteId) || detectPlatform(targetUrl).id || 'generic'), title: safeDownloadName(resolvedFilename),
+      sourceUrl: targetUrl, clientMeta, trigger: clientMeta?.trigger || undefined
+    });
   } catch (error) {
     if (res.headersSent) {
       res.destroy(error);
@@ -1524,6 +1854,36 @@ app.post('/api/douyin/browser-diagnose', async (req, res, next) => {
     next(error);
   }
 });
+
+
+app.get('/api/image-proxy', async (req, res, next) => {
+  try {
+    const url = String(req.query?.url || '');
+    if (!/^https?:\/\//i.test(url)) { res.status(400).end(); return; }
+    await assertPublicUrl(url);
+    const response = await fetchPublicUrl(url, {
+      headers: { 'User-Agent': 'Mozilla/5.0 OnePick', Referer: 'https://weibo.com/' },
+      signal: AbortSignal.timeout(30000)
+    });
+    if (!response.ok || !response.body) { res.status(response.status).end(); return; }
+    const contentType = String(response.headers.get('content-type') || '').toLowerCase();
+    if (!/^image\/(?:avif|gif|jpe?g|png|webp)(?:;|$)/.test(contentType)) { res.status(415).end(); return; }
+    assertContentLength(response, maxImageProxyBytes, '图片');
+    res.setHeader('Cache-Control', 'public, max-age=86400');
+    res.setHeader('Content-Type', contentType);
+    await pipeLimitedResponse(response, res, maxImageProxyBytes);
+  } catch (error) { next(error); }
+});
+
+
+function cleanClientUrl(url) { return String(url || '').trim().replace(/[\u200b-\u200f\uFEFF]/g, '').replace(/[\s，。；、)）\]】}]+$/g, '').replace(/[$]+$/g, ''); }
+
+function normalizeClientInputUrl(url) {
+  const raw = cleanClientUrl(url);
+  const m = raw.match(/^https?:\/\/(?:www\.)?youtube\.com\/shorts\/([A-Za-z0-9_-]+)/i);
+  if (m) return `https://www.youtube.com/watch?v=${m[1]}`;
+  return raw;
+}
 
 app.post('/api/inspect', async (req, res, next) => {
   const started = Date.now();
@@ -1622,6 +1982,7 @@ function shortcutPreferences(body = {}) {
 }
 
 async function sendShortcutDownload({ input, preferences, itemIndex, started, req, res, next }) {
+  const clientMeta = parseClientMeta(req.body?.clientMeta || req.query?.clientMeta);
   const parsed = await parseMedia({ input, preferences });
   const { item, candidates } = selectShortcutItem(parsed.items, itemIndex);
   if (!item) {
@@ -1642,7 +2003,16 @@ async function sendShortcutDownload({ input, preferences, itemIndex, started, re
     return;
   }
 
-  const filename = safeDownloadName(item.filename || `${parsed.platform?.id || 'onepick'}-${Date.now()}.${item.ext || (preferences.mode === 'audio' ? 'm4a' : 'mp4')}`);
+  let filenameBase = item.filename || `${parsed.platform?.id || 'onepick'}-${Date.now()}.${item.ext || (preferences.mode === 'audio' ? 'm4a' : 'mp4')}`;
+    if ((parsed.platform?.id || item.platform) === 'facebook' && /^Facebook(?: 视频)?(?:\.mp4)?$/i.test(String(filenameBase))) {
+      const vid = clientMeta?.videoId || facebookVideoIdFromAny(parsed.sourceUrl, input, item.url);
+      const q = String(preferences.quality || clientMeta?.qualityPreference || '').match(/\d{3,4}/)?.[0] || '';
+      filenameBase = `Facebook-${vid || Date.now()}${q ? '-' + q + 'P' : ''}.${item.ext || 'mp4'}`;
+    }
+    if ((parsed.platform?.id || item.platform || clientMeta?.siteId) === 'kuaishou' && clientMeta?.mediaTitle && /^(?:onepick-media|media(?:[ _-]?file)?|媒体文件)(?:\.[a-z0-9]{2,5})?$/i.test(String(filenameBase).trim())) {
+      filenameBase = `${clientMeta.mediaTitle}.${item.ext || 'mp4'}`;
+    }
+    const filename = safeDownloadName(filenameBase);
   res.setHeader('X-OnePick-Item-Count', String(Array.isArray(parsed.items) ? parsed.items.length : 1));
   res.setHeader('X-OnePick-Platform', String(parsed.platform?.id || item.platform || 'unknown'));
   res.setHeader('X-OnePick-Selected-Filename', encodeURIComponent(filename));
@@ -1694,6 +2064,7 @@ app.post('/api/shortcut/download-text', async (req, res, next) => {
   const started = Date.now();
   const input = typeof req.body === 'string' ? req.body : requestInputText(req.body || {});
   const preferences = normalizeParsePreferences({ mode: req.query?.mode, quality: req.query?.quality });
+  const clientMeta = parseClientMeta(req.query?.clientMeta);
   try {
     if (!extractFirstUrl(input)) {
       console.warn('Shortcut text request missing URL', JSON.stringify({ inputLength: String(input || '').length, inputPreview: String(input || '').replace(/https?:\/\/\S+/gi, '<url>').slice(0, 80) }));
@@ -1709,6 +2080,7 @@ app.get('/api/shortcut/browser-download-info', async (req, res, next) => {
   const started = Date.now();
   const input = String(req.query?.input || req.query?.url || '');
   const preferences = normalizeParsePreferences({ mode: req.query?.mode, quality: req.query?.quality });
+  const clientMeta = parseClientMeta(req.query?.clientMeta);
   try {
     const parsed = await parseMedia({ input, preferences });
     const { item, candidates } = selectShortcutItem(parsed.items, req.query?.itemIndex);
@@ -1728,7 +2100,13 @@ app.get('/api/shortcut/browser-download-info', async (req, res, next) => {
       });
       return;
     }
-    const filename = safeDownloadName(item.filename || `${parsed.platform?.id || 'onepick'}-${Date.now()}.${item.ext || (preferences.mode === 'audio' ? 'm4a' : 'mp4')}`);
+    let filenameBase = item.filename || `${parsed.platform?.id || 'onepick'}-${Date.now()}.${item.ext || (preferences.mode === 'audio' ? 'm4a' : 'mp4')}`;
+    if ((parsed.platform?.id || item.platform) === 'facebook' && /^Facebook(?: 视频)?(?:\.mp4)?$/i.test(String(filenameBase))) {
+      const vid = clientMeta?.videoId || facebookVideoIdFromAny(parsed.sourceUrl, input, item.url);
+      const q = String(preferences.quality || clientMeta?.qualityPreference || '').match(/\d{3,4}/)?.[0] || '';
+      filenameBase = `Facebook-${vid || Date.now()}${q ? '-' + q + 'P' : ''}.${item.ext || 'mp4'}`;
+    }
+    const filename = safeDownloadName(filenameBase);
     let downloadUrl = String(item.url || '');
     const qualities = Array.isArray(item.availableQualities) ? item.availableQualities : [];
     const token = String(req.query?.token || '');
@@ -1737,6 +2115,7 @@ app.get('/api/shortcut/browser-download-info', async (req, res, next) => {
       if (!raw.startsWith('/')) return raw;
       const u = new URL(raw, 'http://127.0.0.1');
       if (token) u.searchParams.set('token', token);
+      if (req.query?.clientMeta) u.searchParams.set('clientMeta', String(req.query.clientMeta));
       if (parsed.duration) u.searchParams.set('mediaDuration', String(parsed.duration));
       return `${u.pathname}?${u.searchParams.toString()}`;
     };
@@ -1745,6 +2124,7 @@ app.get('/api/shortcut/browser-download-info', async (req, res, next) => {
           const u = new URL(downloadUrl, 'http://127.0.0.1');
           u.searchParams.set('quality', q.quality);
           if (token) u.searchParams.set('token', token);
+          if (req.query?.clientMeta) u.searchParams.set('clientMeta', String(req.query.clientMeta));
           if (parsed.duration) u.searchParams.set('mediaDuration', String(parsed.duration));
           return { label: q.label, quality: q.quality, downloadUrl: `${u.pathname}?${u.searchParams.toString()}` };
         })
@@ -1754,14 +2134,47 @@ app.get('/api/shortcut/browser-download-info', async (req, res, next) => {
     } else {
       const proxy = new URLSearchParams({ url: downloadUrl, filename, platform: String(item.platform || parsed.platform?.id || '') });
       if (token) proxy.set('token', token);
+      if (req.query?.clientMeta) proxy.set('clientMeta', String(req.query.clientMeta));
       downloadUrl = `/api/download?${proxy.toString()}`;
     }
-    appendHistory({ kind: 'browser-download-info', ok: true, durationMs: Date.now() - started, processDurationMs: Date.now() - started, mediaDuration: parsed.duration || null, platform: parsed.platform?.id || item.platform || 'unknown', parser: parsed.parser || parsed.engine, title: parsed.title, sourceUrl: parsed.sourceUrl || input, itemCount: Array.isArray(parsed.items) ? parsed.items.length : 1 });
+    // browser-download-info is a preflight for userscript downloads; do not pollute user history.
     res.json({ ok: true, filename, platform: parsed.platform?.id || item.platform || 'unknown', mediaDuration: parsed.duration || null, itemCount: Array.isArray(parsed.items) ? parsed.items.length : 1, qualityOptions, downloadUrl });
   } catch (error) {
     let failedPlatform = null;
     try { const failedUrl = extractFirstUrl(input); failedPlatform = failedUrl ? detectPlatform(failedUrl).id : null; } catch {}
-    appendHistory({ kind: 'browser-download-info', ok: false, durationMs: Date.now() - started, platform: failedPlatform, sourceUrl: input, error: error.message });
+    // browser-download-info failures are surfaced to the userscript diagnostic panel.
+    next(error);
+  }
+});
+
+
+
+app.post('/api/client-capture/youtube', express.json({ limit: '2mb' }), (req, res, next) => {
+  const started = Date.now();
+  try {
+    const body = req.body || {};
+    const videoId = String(body.videoId || '').replace(/[^A-Za-z0-9_-]/g, '').slice(0, 32);
+    if (!videoId) { const e = new Error('缺少 YouTube videoId'); e.statusCode = 400; throw e; }
+    const title = safeDownloadName(String(body.title || `YouTube-${videoId}`).slice(0, 120));
+    const sourceUrl = String(body.sourceUrl || `https://www.youtube.com/watch?v=${videoId}`);
+    const duration = Number(body.duration || 0) || null;
+    const formats = Array.isArray(body.formats) ? body.formats : [];
+    const items = formats.slice(0, 30).map((f, index) => {
+      const url = String(f.url || '');
+      if (!/^https?:\/\//i.test(url)) return null;
+      let mediaHost = '';
+      try { mediaHost = new URL(url).hostname.toLowerCase(); } catch {}
+      if (!/(^|\.)(googlevideo\.com|youtube\.com)$/.test(mediaHost)) return null;
+      const ext = String(f.ext || (String(f.mimeType || '').includes('webm') ? 'webm' : 'mp4')).replace(/[^a-z0-9]/gi, '').slice(0, 8) || 'mp4';
+      const label = String(f.label || f.qualityLabel || f.quality || `format-${index + 1}`).replace(/[\\/:*?"<>|]+/g, '-').slice(0, 40);
+      const filename = safeDownloadName(`${title}-${label}.${ext}`);
+      return { type: String(f.hasAudio === false ? 'video' : 'video'), quality: label, ext, filename, url, filesize: Number(f.filesize || 0) || null, platform: 'youtube', sourceUrl };
+    }).filter(Boolean);
+    if (!items.length) { const e = new Error('浏览器解析未拿到可直接下载的 YouTube URL，可能全部为 signatureCipher/n 参数保护格式。'); e.statusCode = 422; throw e; }
+    appendHistory({ kind: 'client-capture', ok: true, durationMs: Date.now() - started, processDurationMs: Date.now() - started, mediaDuration: duration, platform: 'youtube', parser: 'browser-player', title, sourceUrl, itemCount: items.length });
+    res.json({ ok: true, platform: 'youtube', parser: 'browser-player', title, sourceUrl, mediaDuration: duration, itemCount: items.length, items });
+  } catch (error) {
+    appendHistory({ kind: 'client-capture', ok: false, durationMs: Date.now() - started, platform: 'youtube', error: error.message });
     next(error);
   }
 });
@@ -1771,6 +2184,7 @@ app.get('/api/shortcut/browser-download', async (req, res, next) => {
   const started = Date.now();
   const input = String(req.query?.input || req.query?.url || '');
   const preferences = normalizeParsePreferences({ mode: req.query?.mode, quality: req.query?.quality });
+  const clientMeta = parseClientMeta(req.query?.clientMeta);
   try {
     if (!extractFirstUrl(input)) {
       console.warn('Shortcut browser-download missing URL', JSON.stringify({ inputLength: input.length, inputPreview: input.replace(/https?:\/\/\S+/gi, '<url>').slice(0, 80) }));
@@ -1783,12 +2197,28 @@ app.get('/api/shortcut/browser-download', async (req, res, next) => {
 });
 
 
-app.post('/api/archive', async (req, res, next) => {
+function withConcurrencyLimit(maxConcurrent, handler) {
+  let activeArchives = 0;
+  return async (req, res, next) => {
+    if (activeArchives >= maxConcurrent) {
+      const error = new Error('归档任务繁忙，请稍后重试。');
+      error.statusCode = 429;
+      next(error);
+      return;
+    }
+    activeArchives += 1;
+    try { await handler(req, res, next); }
+    finally { activeArchives -= 1; }
+  };
+}
+
+const runLimitedArchive = withConcurrencyLimit(2, async (req, res, next) => {
   const started = Date.now();
+  const tempDirs = new Set();
   try {
     const items = Array.isArray(req.body?.items) ? req.body.items : [];
     const archiveName = safeDownloadName(req.body?.filename || 'onepick-downloads.zip');
-    const limited = items.slice(0, 50).map((item, index) => ({
+    const limited = items.slice(0, maxArchiveItems).map((item, index) => ({
       url: String(item?.url || ''),
       filename: safeDownloadName(item?.filename || `media-${index + 1}`),
       platform: String(item?.platform || item?.platformId || ''),
@@ -1838,24 +2268,39 @@ app.post('/api/archive', async (req, res, next) => {
           try {
             const dl = await downloadYtDlpToFile(item.sourceUrl, prefs);
             tmp = dl.tempDir;
+            tempDirs.add(tmp);
             archive.append(fs.createReadStream(dl.path), { name: item.filename });
             // finalize 前不能删 tempDir（流还在读），记录待清理
             item._tempDir = tmp;
           } catch (e) {
-            if (tmp) fs.rmSync(tmp, { recursive: true, force: true });
+            if (tmp) { fs.rmSync(tmp, { recursive: true, force: true }); tempDirs.delete(tmp); }
             archive.append(`Failed to download ${item.sourceUrl}: ${e.message}\n`, { name: `_errors/item-${index + 1}.txt` });
           }
           continue;
         }
-        const upstream = await fetch(item.url, {
-          redirect: 'follow',
-          headers: mediaFetchHeaders(item.url, item.cookiePlatform)
-        });
-        if (!upstream.ok || !upstream.body) {
-          archive.append(`Failed to fetch ${item.url}: HTTP ${upstream.status}\n`, { name: `_errors/item-${index + 1}.txt` });
-          continue;
+        const controller = new AbortController();
+        const stopDeadline = createUpstreamDeadline(controller, req, res);
+        try {
+          const upstream = await fetchPublicUrl(item.url, {
+            headers: mediaFetchHeaders(item.url, item.cookiePlatform),
+            signal: controller.signal
+          });
+          if (!upstream.ok || !upstream.body) {
+            stopDeadline();
+            archive.append(`Failed to fetch ${item.url}: HTTP ${upstream.status}\n`, { name: `_errors/item-${index + 1}.txt` });
+            continue;
+          }
+          const source = createLimitedUpstreamStream(upstream, maxRemoteDownloadBytes, controller, '归档文件');
+          source.once('end', stopDeadline);
+          source.once('error', error => {
+            stopDeadline();
+            archive.emit('error', error);
+          });
+          archive.append(source, { name: item.filename });
+        } catch (error) {
+          stopDeadline();
+          throw error;
         }
-        archive.append(Readable.fromWeb(upstream.body), { name: item.filename });
       } catch (error) {
         archive.append(`Failed to fetch ${item.url}: ${error.message}\n`, { name: `_errors/item-${index + 1}.txt` });
       }
@@ -1863,15 +2308,18 @@ app.post('/api/archive', async (req, res, next) => {
 
     await archive.finalize();
     // zip 写完后清理所有 yt-dlp 临时目录
-    for (const item of limited) {
-      if (item._tempDir) fs.rmSync(item._tempDir, { recursive: true, force: true });
-    }
+    for (const tempDir of tempDirs) fs.rmSync(tempDir, { recursive: true, force: true });
+    tempDirs.clear();
     appendHistory({ kind: 'archive', ok: true, durationMs: Date.now() - started, title: archiveName, itemCount: limited.length });
   } catch (error) {
     appendHistory({ kind: 'archive', ok: false, durationMs: Date.now() - started, error: error.message });
     next(error);
+  } finally {
+    for (const tempDir of tempDirs) fs.rmSync(tempDir, { recursive: true, force: true });
   }
 });
+
+app.post('/api/archive', runLimitedArchive);
 
 app.get('/config', (req, res) => {
   res.sendFile(path.join(staticDir, 'config.html'));
@@ -1898,6 +2346,6 @@ app.listen(port, '0.0.0.0', () => {
   console.log(`OnePick Tools listening on :${port}`);
   try { scheduleCookieCloudSync(); } catch (e) { console.error('[cookiecloud] 定时同步初始化失败:', e.message); }
   try { scheduleYtDlpAutoUpdate(); } catch (e) { console.error('[yt-dlp] 自动更新初始化失败:', e.message); }
-  checkComponentsOnStartup().then(v => { cachedToolVersions = v; }).catch(e => console.error('[components] 启动检查失败:', e.message));
+  checkComponentsOnStartup().catch(e => console.error('[components] 启动检查失败:', e.message));
 });
 

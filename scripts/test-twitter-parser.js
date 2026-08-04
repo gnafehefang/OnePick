@@ -5,7 +5,7 @@ import { extractTwitterStatusId } from '../src/parsers/twitter.js';
 assert.equal(detectPlatform('https://x.com/example/status/1812345678901234567').id, 'twitter');
 assert.equal(detectPlatform('https://twitter.com/example/status/1812345678901234567').id, 'twitter');
 assert.equal(extractTwitterStatusId('https://x.com/example/status/1812345678901234567?s=20'), '1812345678901234567');
-assert.equal(listSupportedPlatforms().find(p => p.id === 'twitter')?.parser, 'dedicated');
+assert.equal(listSupportedPlatforms().find(p => p.id === 'twitter')?.parser, 'yt-dlp');
 
 await assert.rejects(
   () => parseMedia({ input: 'https://x.com/someuser' }),

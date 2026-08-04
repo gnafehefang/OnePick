@@ -34,7 +34,9 @@ export async function parseTikTok({ url, platform, preferences }) {
     const parsed = await parseWithYtDlp(url, [
       ...getCookieArgs('tiktok'),
       '--referer', 'https://www.tiktok.com/',
-      '--user-agent', 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36'
+      '--user-agent', 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36',
+      '--impersonate', 'Chrome',
+      '--extractor-args', 'tiktok:api_hostname=api16-normal-c-useast1a.tiktokv.com'
     ], resolvedPreferences);
     const response = buildParseResponse({ parsed, platform, sourceUrl: url, resolvedUrl: url, extra: { videoId, parser: 'tiktok' } });
     response.items = response.items.map((item, index) => ({

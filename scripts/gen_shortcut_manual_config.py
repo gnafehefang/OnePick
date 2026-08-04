@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# OnePick Shortcut v15: fixed attachment offsets for detected clipboard URL.
+# OnePick Shortcut v16: use plain-text input and normalize HTTP media before Photos import.
 import plistlib, uuid
 from pathlib import Path
 
@@ -25,7 +25,7 @@ def alert(msg): return action("is.workflow.actions.alert",{"WFAlertActionTitle":
 VIBRATE=action("is.workflow.actions.vibrate")
 EXIT=action("is.workflow.actions.exit")
 A=[]
-A.append(comment("OnePick 视频下载\n配置：若剪贴板有 onepick-config|服务器|token 会自动使用；否则使用导入时填写的一整段。\n链接：分享输入和剪贴板文本一起交给后端提取；本地不再判断链接。"))
+A.append(comment("OnePick 视频下载 v16\n修复 iOS 上 X 下载完成后出现空白页：分享输入和剪贴板只按纯文本交给后端；响应媒体直接存入相册。\n配置：若剪贴板有 onepick-config|服务器|token 会自动使用；否则使用导入时填写的一整段。"))
 # import-time fallback config
 u_cfg=U(); cfg_idx=len(A); A.append(text(u_cfg,"onepick-config|https://onepick.download.com:8088|apikey.PASTE_TOKEN_HERE")); A.append(setv("OP_CFG",u_cfg,"文本"))
 uv=U(); A.append(text(uv,"on")); A.append(setv("OP_VIBRATE",uv,"文本"))
@@ -40,9 +40,8 @@ A.append(action("is.workflow.actions.setvariable",{"WFVariableName":"OP_SHARE","
 us=U(); A.append(action("is.workflow.actions.text.split",{"UUID":us,"text":tok_vars("\ufffc",[(0,'var',"OP_CFG",None)]),"WFTextSeparator":"Custom","WFTextCustomSeparator":"|"}))
 usrv=U(); A.append(action("is.workflow.actions.getitemfromlist",{"UUID":usrv,"WFInput":out_attach(us,"拆分文本"),"WFItemSpecifier":"Item At Index","WFItemIndex":2})); A.append(setv("OP_SERVER",usrv,"列表项"))
 utok=U(); A.append(action("is.workflow.actions.getitemfromlist",{"UUID":utok,"WFInput":out_attach(us,"拆分文本"),"WFItemSpecifier":"Item At Index","WFItemIndex":3})); A.append(setv("OP_TOKEN",utok,"列表项"))
-# link/input: share text + native detected clipboard URL + raw clipboard text. Backend extracts first valid URL.
-udetect=U(); A.append(action("is.workflow.actions.detect.link",{"UUID":udetect,"WFInput":tok_vars("\ufffc",[(0,'var',"OP_CLIP_RAW",None)])}))
-ulink=U(); A.append(action("is.workflow.actions.gettext",{"UUID":ulink,"WFTextActionText":tok_vars("分享输入：\ufffc\n剪贴板URL：\ufffc\n剪贴板文本：\ufffc",[(5,'var',"OP_SHARE",None),(14,'out',udetect,"URL"),(22,'var',"OP_CLIP",None)])})); A.append(setv("OP_LINK",ulink,"文本"))
+# link/input: pass only plain text. Rich detect.link output can serialize as a blank JSON value.
+ulink=U(); A.append(action("is.workflow.actions.gettext",{"UUID":ulink,"WFTextActionText":tok_vars("分享输入：\ufffc\n剪贴板文本：\ufffc",[(5,'var',"OP_SHARE",None),(13,'var',"OP_CLIP",None)])})); A.append(setv("OP_LINK",ulink,"文本"))
 # request
 mid="/api/shortcut/download?token="
 uurl=U(); A.append(action("is.workflow.actions.gettext",{"UUID":uurl,"WFTextActionText":tok_vars("\ufffc"+mid+"\ufffc",[(0,'var',"OP_SERVER",None),(1+len(mid),'var',"OP_TOKEN",None)])})); A.append(setv("OP_URL",uurl,"文本"))

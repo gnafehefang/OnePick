@@ -609,3 +609,53 @@ code { background: var(--surface-soft); border: 1px solid var(--line-soft); bord
 .card-action-buttons[hidden]{display:none!important}
 
 .status-strip{min-height:168px}.cookie-platform-grid{min-height:220px}.skeleton-cell{opacity:.58}
+
+.compose-body.has-result{min-height:0;max-height:none;overflow:visible;padding:10px 12px 4px}.compose-body.has-result .result{margin:0;border:0;background:transparent;padding:0}.compose-body.has-result .result-topbar{margin:0 0 6px}.compose-body.has-result .result-head{margin-bottom:10px}.compose-body.has-result details{margin-top:8px}.cover-placeholder{display:flex;align-items:center;justify-content:center;background:linear-gradient(135deg,var(--mint-tint),#f7f4ec);color:var(--mint-ink)}.compose-body::-webkit-scrollbar,.cookie-editor::-webkit-scrollbar,.info-dialog-body::-webkit-scrollbar{width:6px}.compose-body::-webkit-scrollbar-thumb,.cookie-editor::-webkit-scrollbar-thumb,.info-dialog-body::-webkit-scrollbar-thumb{background:rgba(35,95,76,.22);border-radius:999px}.compose-body::-webkit-scrollbar-track{background:transparent}
+
+
+/* Compact parsed/error states: keep paste area large only before parsing. */
+.compose-body.has-result,
+.compose-body.has-error,
+.compose-body.is-compact {
+  min-height: 0 !important;
+  max-height: none !important;
+  overflow: visible !important;
+  padding: 10px 12px 6px !important;
+}
+.compose-body.has-result .paste-box,
+.compose-body.has-error .paste-box,
+.compose-body.is-compact .paste-box,
+.compose-body.has-result textarea,
+.compose-body.has-error textarea,
+.compose-body.is-compact textarea {
+  min-height: 44px !important;
+  max-height: 88px !important;
+  height: auto !important;
+}
+.compose-body.has-error .result-panel,
+.compose-body.has-result .result-panel { margin-top: 10px !important; }
+.parse-error, .error-card, .alert-error {
+  margin-top: 10px !important;
+}
+
+
+/* CookieCloud actions: keep 3 primary maintenance buttons in one row on desktop. */
+#cookiecloud-panel .inline-actions,
+#proxy-panel .inline-actions {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 8px;
+  align-items: stretch;
+}
+#cookiecloud-panel .inline-actions .mini-button,
+#proxy-panel .inline-actions .mini-button { width: 100%; min-width: 0; white-space: nowrap; display: inline-flex; justify-content: center; align-items: center; text-align: center; }
+#view-env #cc-status {
+  white-space: normal;
+  overflow: visible;
+  text-overflow: clip;
+  max-height: none;
+  line-height: 1.5;
+}
+@media (max-width: 560px) {
+  #cookiecloud-panel .inline-actions, #proxy-panel .inline-actions { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}

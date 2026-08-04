@@ -1,4 +1,4 @@
-import { loadEnvView, loadHistoryView } from '/env.js?v=2.4.47';
+import { loadEnvView, loadHistoryView } from '/env.js?v=2.4.61';
 
 const form = document.querySelector('#parse-form');
 const cardHistoryButton = document.querySelector('.card-history-button');
@@ -218,7 +218,7 @@ function renderResult(payload) {
       <button class="mini-button reinput-button" type="button" data-reinput title="返回重新输入链接">↩ 重新输入</button>
     </div>
     <div class="result-head">
-      ${payload.cover ? `<img src="${escapeHtml(payload.cover)}" alt="cover" />` : '<div class="cover-placeholder"><img src="/logo.png?v=2.4.47" alt="" width="40" height="40" /></div>'}
+      ${payload.cover ? `<img src="/api/image-proxy?url=${encodeURIComponent(payload.cover)}" alt="" onerror="this.replaceWith(Object.assign(document.createElement('div'),{className:'cover-placeholder',innerHTML:'<img src=&quot;/logo.png?v=2.4.61&quot; alt=&quot;&quot; width=&quot;42&quot; height=&quot;42&quot; />'}))" />` : '<div class="cover-placeholder"><img src="/logo.png?v=2.4.61" alt="" width="42" height="42" /></div>'}
       <div>
         <p class="eyebrow">${escapeHtml(platformName)} · ${escapeHtml(payload.engine || 'parser')}</p>
         <h3>${escapeHtml(cleanTitle(payload.title, '解析结果'))}</h3>
@@ -455,12 +455,21 @@ function triggerSave(blob, filename) {
 
 // 复合卡片：输入框与解析结果复用同一区域，清晰度/按钮工具栏固定不动。
 // 解析后显示结果、隐藏输入框；双击结果空白处切回输入框重新输入。
-function showResultView() {
+function setComposeState(state) {
+  const body = document.querySelector('.compose-body');
+  if (!body) return;
+  body.classList.toggle('has-result', state === 'result');
+  body.classList.toggle('has-error', state === 'error');
+  body.classList.toggle('is-compact', state === 'result' || state === 'error');
+}
+function showResultView(state = 'result') {
   if (input) input.hidden = true;
+  setComposeState(state);
   if (result) result.hidden = false;
 }
 function showInputView() {
   if (result) { result.hidden = true; result.innerHTML = ''; }
+  setComposeState('input');
   if (input) { input.hidden = false; input.focus(); }
 }
 // 双击结果空白处（非按钮/链接/可交互元素）返回输入
@@ -476,11 +485,12 @@ form?.addEventListener('submit', async (event) => {
     startBatch(urls);
     return;
   }
-  showResultView();
+  showResultView('result');
   result.textContent = '正在解析，第一次可能会稍慢...';
   try {
     renderResult(await parseOne(input.value));
   } catch (error) {
+    showResultView('error');
     result.innerHTML = `<div class="error-card"><strong>解析失败</strong><p>${escapeHtml(error.message)}</p><p class="muted-text">${escapeHtml(errorAdvice(error.message))}</p><a class="button small ghost" href="/config">查看状态 / 最近错误</a></div>`;
   }
 });
@@ -788,6 +798,7 @@ document.querySelector('#inspect-button')?.addEventListener('click', async () =>
     })();
     renderInspect(payload);
   } catch (error) {
+    showResultView('error');
     result.innerHTML = `<div class="error-card"><strong>诊断失败</strong><p>${escapeHtml(error.message)}</p><p class="muted-text">${escapeHtml(errorAdvice(error.message))}</p></div>`;
   }
 });

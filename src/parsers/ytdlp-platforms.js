@@ -13,10 +13,10 @@ export const YTDLP_PLATFORM_CONFIG = {
     referer: 'https://www.youtube.com/',
     ua: DESKTOP_UA,
     // YouTube 需要 JS 运行时解 nsig + 远程组件
-    extra: ['--js-runtimes', 'node:/usr/local/bin/node', '--remote-components', 'ejs:github']
+    extra: ['--extractor-args', 'youtube:player_client=web', '--js-runtimes', 'node:/usr/local/bin/node', '--remote-components', 'ejs:github']
   },
-  // TikTok 对强制桌面 UA/referer 更容易 403；交给 yt-dlp 默认客户端/impersonation。
-  tiktok: { extra: [] },
+  // TikTok：优先 web 客户端，避开某些默认移动客户端返回的 rehydration 数据结构缺失。
+  tiktok: { referer: 'https://www.tiktok.com/', ua: DESKTOP_UA, extra: ['--impersonate', 'Chrome', '--extractor-args', 'tiktok:api_hostname=api16-normal-c-useast1a.tiktokv.com'] },
   twitter: {
     referer: 'https://x.com/',
     ua: DESKTOP_UA,

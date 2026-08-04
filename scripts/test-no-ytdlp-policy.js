@@ -4,7 +4,14 @@ import fs from 'node:fs';
 import path from 'node:path';
 
 const parserDir = path.join(process.cwd(), 'src', 'parsers');
-const allowed = new Set(['shared.js', 'youtube.js']);
+const allowed = new Set([
+  'shared.js',
+  'youtube.js',
+  // iOS/server TikTok support intentionally remains after the desktop userscript integration was removed.
+  'tiktok.js',
+  'ytdlp-parser.js',
+  'ytdlp-platforms.js'
+]);
 const offenders = [];
 for (const name of fs.readdirSync(parserDir)) {
   if (!name.endsWith('.js') || allowed.has(name)) continue;

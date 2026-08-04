@@ -212,7 +212,7 @@ function renderPlatforms(data) {
       </div>
       <div class="platform-card-actions">
         <button class="mini-button" data-cookie-edit="${escapeHtml(platform.id)}" data-plat-name="${escapeHtml(platform.name)}">维护 Cookie</button>
-        ${hasCookie ? `<button class="mini-button" data-cookie-check="${escapeHtml(platform.id)}">检查</button>` : ''}
+        ${hasCookie ? `<button class="mini-button" data-cookie-check="${escapeHtml(platform.id)}">${platform.id === 'youtube' ? '检查' : '检查'}</button>` : ''}
       </div>
     </article>`;
   }).join('');
@@ -478,7 +478,11 @@ async function saveCookieCloud() {
     if (payload.sync?.error) {
       flashStatus('#cc-status', '已保存定时同步，但本次同步失败', 'warn');
     } else if (payload.sync) {
-      flashStatus('#cc-status', '已启用，同步完成', 'ok');
+      const yt = payload.sync.youtubeLocal;
+      if (yt && yt.important) {
+        const missing = Object.entries(yt.important).filter(([, ok]) => !ok).map(([name]) => name);
+        flashStatus('#cc-status', `已启用，同步完成。YouTube ${missing.length ? '缺少：' + missing.join(', ') : '关键登录态完整'}`, missing.length ? 'warn' : 'ok');
+      } else flashStatus('#cc-status', '已启用，同步完成', 'ok');
     } else {
       flashStatus('#cc-status', '已保存。', 'ok');
     }
@@ -497,12 +501,20 @@ async function syncCookieCloud() {
     const response = await fetch('/api/cookiecloud/sync', { method: 'POST' });
     const payload = await response.json().catch(() => ({}));
     if (!response.ok) throw new Error(payload.error || '同步失败');
-    flashStatus('#cc-status', '同步完成', 'ok');
+    const yt = payload.youtubeLocal;
+    if (yt && yt.important) {
+      const missing = Object.entries(yt.important).filter(([, ok]) => !ok).map(([name]) => name);
+      const msg = `同步完成。YouTube 本地 ${yt.count || 0} 条；域：${(yt.domains || []).join(', ') || '-'}；${missing.length ? '缺少：' + missing.join(', ') : '关键登录态完整'}`;
+      flashStatus('#cc-status', msg, missing.length ? 'warn' : 'ok');
+    } else {
+      flashStatus('#cc-status', '同步完成', 'ok');
+    }
     loadEnvView(true);
   } catch (error) {
     flashStatus('#cc-status', `同步失败：${error.message}`, 'error');
   }
 }
+
 
 async function deleteCookieCloud() {
   if (!confirm('确定清除 CookieCloud 配置？已同步到本地的 Cookie 文件不会删除。')) return;
@@ -632,6 +644,13 @@ async function clearCookie() {
 
 async function checkCookie(platformId) {
   try {
+    if (platformId === 'youtube') {
+      const response = await fetch('/api/cookiecloud/inspect?platform=youtube', { credentials: 'same-origin' });
+      const payload = await response.json().catch(() => ({}));
+      if (!response.ok || !payload.ok) throw new Error(payload.error || `HTTP ${response.status}`);
+      showInfoDialog('YouTube CookieCloud 检查', cookieInspectText(payload));
+      return;
+    }
     const response = await fetch(`/api/cookies/${encodeURIComponent(platformId)}/check`);
     const payload = await response.json().catch(() => ({}));
     const ok = response.ok && payload.ok;

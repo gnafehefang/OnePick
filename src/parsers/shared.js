@@ -4,6 +4,7 @@ import dns from 'node:dns/promises';
 import net from 'node:net';
 import fs from 'node:fs';
 import path from 'node:path';
+import { activeYoutubeMasterPath } from '../youtube-cookie-store.js';
 
 const execFileAsync = promisify(execFile);
 
@@ -14,7 +15,7 @@ export const PLATFORM_PATTERNS = [
   { id: 'bilibili', name: 'Bilibili', domains: ['bilibili.com', 'b23.tv'] },
   { id: 'weibo', name: '微博', domains: ['weibo.com', 'weibo.cn'] },
   { id: 'tiktok', name: 'TikTok', domains: ['tiktok.com', 'vm.tiktok.com'] },
-  { id: 'youtube', name: 'YouTube', domains: ['youtube.com', 'youtu.be'] },
+  { id: 'youtube', name: 'YouTube', domains: ['youtube.com', 'youtu.be', 'google.com', 'accounts.google.com'] },
   { id: 'instagram', name: 'Instagram', domains: ['instagram.com'] },
   { id: 'twitter', name: 'X / Twitter', domains: ['x.com', 'twitter.com'] },
   { id: 'facebook', name: 'Facebook', domains: ['facebook.com', 'fb.watch'] },
@@ -131,6 +132,7 @@ export function getProxyStatus() {
   return {
     enabled: config.enabled,
     configured: Boolean(config.url),
+    // 仅给已认证的本地配置界面回填；runtime/config API 会在下一轮 scope 分离后改为脱敏 DTO。
     url: config.url,
     backups: config.backups || [],
     urlMasked: maskProxyUrl(config.url),
@@ -190,7 +192,7 @@ export function getCookiePath(platformId = '') {
 }
 
 export function hasCookieFile(platformId = '') {
-  const cookiePath = getCookiePath(platformId);
+  const cookiePath = String(platformId) === 'youtube' ? activeYoutubeMasterPath() : getCookiePath(platformId);
   try {
     return Boolean(cookiePath) && fs.existsSync(cookiePath) && fs.statSync(cookiePath).size > 0;
   } catch {
@@ -201,7 +203,8 @@ export function hasCookieFile(platformId = '') {
 export function getCookieArgs(platformId = '') {
   // TikTok 当前 CookieCloud Cookie 容易触发 403/rehydration，实测无 Cookie 更稳定。
   if (String(platformId || '') === 'tiktok') return [];
-  return hasCookieFile(platformId) ? ['--cookies', getCookiePath(platformId)] : [];
+  const cookiePath = String(platformId) === 'youtube' ? activeYoutubeMasterPath() : getCookiePath(platformId);
+  return hasCookieFile(platformId) ? ['--cookies', cookiePath] : [];
 }
 
 export const DOWNLOAD_COOKIE_REQUIRED_PLATFORMS = new Set(['xiaohongshu', 'kuaishou']);
@@ -229,7 +232,7 @@ export function markCookieRequiredItems(items = [], platformId = '') {
 
 
 export function getCookieHeader(platformId = '') {
-  const cookiePath = getCookiePath(platformId);
+  const cookiePath = String(platformId) === 'youtube' ? activeYoutubeMasterPath() : getCookiePath(platformId);
   try {
     if (!cookiePath || !fs.existsSync(cookiePath)) return '';
     const pairs = [];
@@ -281,39 +284,139 @@ export function extractFirstUrl(input = '') {
   return match[0].replace(/[，。；、;,.。)）\]】>]+$/g, '');
 }
 
+export function hostMatchesDomain(hostname = '', domains = []) {
+  const host = String(hostname || '').toLowerCase().replace(/\.$/, '');
+  return domains.some(domain => {
+    const value = String(domain || '').toLowerCase().replace(/^\./, '');
+    return value && (host === value || host.endsWith(`.${value}`));
+  });
+}
+
+const DOWNLOAD_COOKIE_DOMAINS = {
+  xiaohongshu: ['xiaohongshu.com', 'xhscdn.com'],
+  kuaishou: ['kuaishou.com', 'kwaicdn.com', 'gifshow.com', 'chenzhongtech.com'],
+  twitter: ['x.com', 'twitter.com', 'twimg.com']
+};
+
+export function downloadCookiePlatformForUrl(targetUrl = '', explicitPlatform = '') {
+  try {
+    const host = new URL(targetUrl).hostname.toLowerCase();
+    const inferred = Object.entries(DOWNLOAD_COOKIE_DOMAINS).find(([, domains]) => hostMatchesDomain(host, domains))?.[0] || '';
+    const explicit = String(explicitPlatform || '').replace(/[^a-z0-9_-]/gi, '');
+    if (explicit && explicit === inferred && requiresCookieForDownload(explicit)) return explicit;
+    return inferred;
+  } catch {
+    return '';
+  }
+}
+
+export function mediaRequestHeaders(targetUrl = '', platformId = '') {
+  const headers = {
+    'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36',
+    'Accept': 'video/webm,video/mp4,video/*,*/*',
+    'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+    'Range': 'bytes=0-'
+  };
+  let host = '';
+  try { host = new URL(targetUrl).hostname.toLowerCase(); } catch {}
+  const rules = [
+    [['douyin.com', 'douyinvod.com', 'bytecdn.cn', 'byteimg.com'], 'https://www.douyin.com/'],
+    [DOWNLOAD_COOKIE_DOMAINS.xiaohongshu, 'https://www.xiaohongshu.com/'],
+    [DOWNLOAD_COOKIE_DOMAINS.kuaishou, 'https://www.kuaishou.com/'],
+    [['bilibili.com', 'bilivideo.com'], 'https://www.bilibili.com/'],
+    [['youtube.com', 'googlevideo.com'], 'https://www.youtube.com/'],
+    [['weibo.com', 'weibo.cn', 'sinaimg.cn'], 'https://weibo.com/'],
+    [['tiktok.com', 'tiktokcdn.com'], 'https://www.tiktok.com/'],
+    [DOWNLOAD_COOKIE_DOMAINS.twitter, 'https://x.com/']
+  ];
+  const referer = rules.find(([domains]) => hostMatchesDomain(host, domains))?.[1];
+  if (referer) {
+    headers.Referer = referer;
+    headers.Origin = new URL(referer).origin;
+  }
+  const inferred = downloadCookiePlatformForUrl(targetUrl, platformId);
+  const cookieHeader = inferred ? getCookieHeader(inferred) : '';
+  if (cookieHeader) headers.Cookie = cookieHeader;
+  return headers;
+}
+
 export function detectPlatform(url) {
   let hostname = '';
   try { hostname = new URL(url).hostname.toLowerCase(); } catch { return { id: 'unknown', name: '未知平台' }; }
-  return PLATFORM_PATTERNS.find(platform => platform.domains.some(domain => hostname === domain || hostname.endsWith(`.${domain}`))) || { id: 'generic', name: '通用链接' };
+  return PLATFORM_PATTERNS.find(platform => hostMatchesDomain(hostname, platform.domains)) || { id: 'generic', name: '通用链接' };
 }
 
 function isPrivateIp(address) {
   if (!address) return true;
-  if (net.isIPv4(address)) {
-    const [a, b] = address.split('.').map(Number);
-    return a === 10 || a === 127 || a === 0 || (a === 172 && b >= 16 && b <= 31) || (a === 192 && b === 168) || (a === 169 && b === 254);
+  const raw = String(address).toLowerCase().split('%')[0];
+  const mapped = raw.match(/^::ffff:(\d+\.\d+\.\d+\.\d+)$/);
+  if (mapped) return isPrivateIp(mapped[1]);
+  if (net.isIPv4(raw)) {
+    const [a, b] = raw.split('.').map(Number);
+    // Permit only globally routable IPv4 unicast; deny private, carrier, documentation, multicast and reserved space.
+    return a === 0 || a === 10 || a === 127 || a >= 224 ||
+      (a === 100 && b >= 64 && b <= 127) ||
+      (a === 169 && b === 254) ||
+      (a === 172 && b >= 16 && b <= 31) ||
+      (a === 192 && (b === 0 || b === 2 || b === 168)) ||
+      (a === 198 && (b === 18 || b === 19 || b === 51)) ||
+      (a === 203 && b === 0);
   }
-  if (net.isIPv6(address)) return address === '::1' || address.startsWith('fc') || address.startsWith('fd') || address.startsWith('fe80:');
+  if (net.isIPv6(raw)) {
+    // IPv6 global unicast is 2000::/3. Everything else is local, special-use or reserved.
+    return !/^[23][0-9a-f]{0,3}:/i.test(raw);
+  }
   return true;
+}
+
+function publicUrlError(message) {
+  const error = new Error(message);
+  error.statusCode = 400;
+  return error;
 }
 
 export async function assertPublicUrl(url) {
   let parsed;
-  try { parsed = new URL(url); } catch { const e = new Error('链接格式不正确。'); e.statusCode = 400; throw e; }
-  if (!['http:', 'https:'].includes(parsed.protocol)) { const e = new Error('只支持 http/https 链接。'); e.statusCode = 400; throw e; }
-  if (['localhost', '127.0.0.1', '::1'].includes(parsed.hostname.toLowerCase())) { const e = new Error('不允许解析本地地址。'); e.statusCode = 400; throw e; }
+  try { parsed = new URL(url); } catch { throw publicUrlError('链接格式不正确。'); }
+  if (!['http:', 'https:'].includes(parsed.protocol)) throw publicUrlError('只支持 http/https 链接。');
+  if (parsed.username || parsed.password) throw publicUrlError('链接中不允许包含用户名或密码。');
+  if (['localhost', '127.0.0.1', '::1'].includes(parsed.hostname.toLowerCase())) throw publicUrlError('不允许解析本地地址。');
+  let records;
   try {
-    const records = await dns.lookup(parsed.hostname, { all: true, verbatim: true });
-    if (records.some(record => isPrivateIp(record.address))) { const e = new Error('不允许解析内网地址。'); e.statusCode = 400; throw e; }
-  } catch (error) {
-    if (error.statusCode) throw error;
+    records = await dns.lookup(parsed.hostname, { all: true, verbatim: true });
+  } catch {
+    throw publicUrlError('链接域名无法解析。');
   }
+  if (!records.length) throw publicUrlError('链接域名无法解析。');
+  if (records.some(record => isPrivateIp(record.address))) throw publicUrlError('不允许解析内网地址。');
+  return parsed;
+}
+
+export async function fetchPublicUrl(url, options = {}, { maxRedirects = 5 } = {}) {
+  let current = String(url || '');
+  for (let i = 0; i <= maxRedirects; i += 1) {
+    await assertPublicUrl(current);
+    const response = await fetch(current, { ...options, redirect: 'manual' });
+    const location = response.headers.get('location');
+    if (!location || ![301, 302, 303, 307, 308].includes(response.status)) return response;
+    if (i === maxRedirects) throw publicUrlError('下载源重定向次数过多。');
+    const next = new URL(location, current).toString();
+    const previousOrigin = new URL(current).origin;
+    const nextOrigin = new URL(next).origin;
+    if (previousOrigin !== nextOrigin && options.headers) {
+      options = { ...options, headers: { ...options.headers } };
+      for (const name of ['Cookie', 'cookie', 'Authorization', 'authorization', 'Origin', 'origin', 'Referer', 'referer']) delete options.headers[name];
+    }
+    current = next;
+  }
+  throw publicUrlError('下载源重定向次数过多。');
 }
 
 export async function resolveRedirects(url, { maxRedirects = 8 } = {}) {
   let current = url;
   const chain = [];
   for (let i = 0; i < maxRedirects; i += 1) {
+    await assertPublicUrl(current);
     const response = await fetch(current, {
       method: 'GET',
       redirect: 'manual',
@@ -418,7 +521,7 @@ export async function parseWithYtDlp(url, extraArgs = [], preferences = {}, plat
   for (let i = 0; i < attempts.length; i++) {
     const proxyUrl = attempts[i];
     const proxyArgs = proxyUrl ? ['--proxy', proxyUrl] : [];
-    const args = [...proxyArgs, '--dump-single-json', '--no-playlist', '--skip-download', '--no-warnings', '--socket-timeout', '20', ...extraArgs, url];
+    const args = [...proxyArgs, '--dump-single-json', '--no-playlist', '--skip-download', '--no-warnings', '--no-cookies-from-browser', '--socket-timeout', '20', ...extraArgs, url];
     try {
       const { stdout } = await execFileAsync('yt-dlp', args, { timeout: 60000, maxBuffer: 16 * 1024 * 1024 });
       const info = JSON.parse(stdout);

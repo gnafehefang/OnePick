@@ -1,8 +1,19 @@
+function isDirectMediaUrl(url = '') {
+  // HLS manifests must stay on yt-dlp/ffmpeg path; proxying them only downloads playlist text.
+  return /\.(mp4|m4v|mov|webm)(?:[?#].*)?$/i.test(String(url)) || /(?:fbcdn|fbsbx|cdninstagram)\.net/i.test(String(url));
+}
+
 import { makeYtDlpParser } from './ytdlp-parser.js';
 
 const genericYtDlp = makeYtDlpParser('generic');
 
 export async function parseGeneric({ url, platform, preferences }) {
+  if (isDirectMediaUrl(url)) {
+    const clean = String(url);
+    const ext = /m3u8(?:[?#]|$)/i.test(clean) ? 'm3u8' : 'mp4';
+    const title = platform?.id === 'facebook' ? 'Facebook 视频' : '媒体文件';
+    return { platform: platform || { id: 'generic', name: '通用链接' }, parser: 'direct-media', title, sourceUrl: clean, items: [{ type: 'video', quality: 'source', ext, filename: `${title}.${ext}`, url: clean }] };
+  }
   try {
     return await genericYtDlp({ url, platform: platform || { id: 'generic', name: '通用链接' }, preferences });
   } catch (error) {

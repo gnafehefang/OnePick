@@ -87,14 +87,42 @@ export function decryptCookieCloud(uuid, password, encrypted) {
 // Fetch
 // ---------------------------------------------------------------------------
 
+const COOKIECLOUD_MAX_RESPONSE_BYTES = Number(process.env.COOKIECLOUD_MAX_RESPONSE_BYTES || 8 * 1024 * 1024);
+
 function normalizeServer(server) {
-  return String(server || '').trim().replace(/\/+$/, '');
+  let parsed;
+  try { parsed = new URL(String(server || '').trim()); } catch { throw new Error('CookieCloud server 地址格式不正确。'); }
+  if (!['http:', 'https:'].includes(parsed.protocol) || parsed.username || parsed.password) throw new Error('CookieCloud server 只支持不含凭据的 http/https 地址。');
+  parsed.hash = '';
+  parsed.search = '';
+  parsed.pathname = parsed.pathname.replace(/\/+$/, '');
+  return parsed.toString().replace(/\/$/, '');
+}
+
+async function readLimitedText(response, limit = COOKIECLOUD_MAX_RESPONSE_BYTES) {
+  const declared = Number(response.headers.get('content-length') || 0);
+  if (declared > limit) throw new Error('CookieCloud 响应过大。');
+  const reader = response.body?.getReader();
+  if (!reader) return '';
+  const chunks = [];
+  let size = 0;
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      size += value.byteLength;
+      if (size > limit) throw new Error('CookieCloud 响应过大。');
+      chunks.push(value);
+    }
+  } finally {
+    if (size > limit) await reader.cancel().catch(() => {});
+  }
+  return new TextDecoder().decode(Buffer.concat(chunks));
 }
 
 // Fetch from CookieCloud server and decrypt. Uses GET /get/<uuid>.
 export async function fetchCookieCloud({ server, uuid, password }) {
   const base = normalizeServer(server);
-  if (!base) throw new Error('缺少 CookieCloud server 地址。');
   if (!uuid) throw new Error('缺少 uuid。');
   if (!password) throw new Error('缺少 password。');
 
@@ -102,25 +130,25 @@ export async function fetchCookieCloud({ server, uuid, password }) {
   let response;
   try {
     response = await fetch(url, {
-      method: 'GET',
+      method: 'GET', redirect: 'error',
       headers: { accept: 'application/json' },
       signal: AbortSignal.timeout(20000)
     });
   } catch (error) {
     throw new Error(`无法连接 CookieCloud 服务器：${error.message}`);
   }
-  if (!response.ok) {
-    throw new Error(`CookieCloud 服务器返回 ${response.status} ${response.statusText}。`);
-  }
+  if (!response.ok) throw new Error(`CookieCloud 服务器返回 ${response.status} ${response.statusText}。`);
   let payload;
   try {
-    payload = await response.json();
-  } catch {
+    payload = JSON.parse(await readLimitedText(response));
+  } catch (error) {
+    if (error.message === 'CookieCloud 响应过大。') throw error;
     throw new Error('CookieCloud 服务器返回内容不是 JSON。');
   }
   if (!payload || typeof payload.encrypted !== 'string' || !payload.encrypted) {
     throw new Error('CookieCloud 服务器返回内容缺少 encrypted 字段（uuid 可能不存在）。');
   }
+  if (Buffer.byteLength(payload.encrypted, 'utf8') > COOKIECLOUD_MAX_RESPONSE_BYTES) throw new Error('CookieCloud 加密内容过大。');
   return decryptCookieCloud(uuid, password, payload.encrypted);
 }
 
@@ -175,6 +203,64 @@ export function mapCookiesToPlatforms(cookieData, platformDomainMap) {
     }
   }
   return result;
+}
+
+
+const YOUTUBE_REQUIRED_COOKIE_NAMES = ['SID','HSID','SSID','APISID','SAPISID','__Secure-1PSID','__Secure-3PSID','LOGIN_INFO'];
+
+function cookieNamesFromNetscapeFile(filePath) {
+  try {
+    if (!fs.existsSync(filePath)) return new Set();
+    const names = new Set();
+    for (const line of fs.readFileSync(filePath, 'utf8').split(/\r?\n/)) {
+      if (!line || line.startsWith('#')) continue;
+      const parts = line.split('\t');
+      if (parts.length >= 7) names.add(parts[5]);
+    }
+    return names;
+  } catch { return new Set(); }
+}
+
+function cookieLinesCompleteForPlatform(platformId, lines = []) {
+  if (platformId !== 'youtube') return true;
+  const names = new Set();
+  for (const line of lines) {
+    const parts = String(line || '').split('\t');
+    if (parts.length >= 7) names.add(parts[5]);
+  }
+  return YOUTUBE_REQUIRED_COOKIE_NAMES.every(name => names.has(name));
+}
+
+function existingCookieFileMoreComplete(platformId, filePath, newLines = []) {
+  if (platformId !== 'youtube' || !fs.existsSync(filePath)) return false;
+  const oldNames = cookieNamesFromNetscapeFile(filePath);
+  const newNames = new Set(newLines.map(line => String(line || '').split('\t')[5]).filter(Boolean));
+  const oldScore = YOUTUBE_REQUIRED_COOKIE_NAMES.filter(name => oldNames.has(name)).length;
+  const newScore = YOUTUBE_REQUIRED_COOKIE_NAMES.filter(name => newNames.has(name)).length;
+  return oldScore >= YOUTUBE_REQUIRED_COOKIE_NAMES.length && newScore < oldScore;
+}
+
+
+function cookieFileSummary(filePath, platformId = '') {
+  const required = platformId === 'youtube' ? YOUTUBE_REQUIRED_COOKIE_NAMES : [];
+  const names = new Set();
+  const domains = new Set();
+  let count = 0;
+  try {
+    if (fs.existsSync(filePath)) {
+      for (const line of fs.readFileSync(filePath, 'utf8').split(/\r?\n/)) {
+        if (!line || line.startsWith('#')) continue;
+        const parts = line.split('\t');
+        if (parts.length >= 7) { count += 1; domains.add(parts[0]); names.add(parts[5]); }
+      }
+    }
+  } catch { /* ignore */ }
+  return {
+    count,
+    domains: [...domains].sort(),
+    complete: required.length ? required.every(name => names.has(name)) : count > 0,
+    missing: required.filter(name => !names.has(name))
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -277,11 +363,17 @@ export async function syncCookieCloudToFiles({
     }
     const content = ['# Netscape HTTP Cookie File', ...lines].join('\n') + '\n';
     try {
+      if (existingCookieFileMoreComplete(platformId, filePath, lines)) {
+        const summary = cookieFileSummary(filePath, platformId);
+        skipped.push({ platform: platformId, reason: '新同步的 YouTube Cookie 缺关键登录态，已保留本地较完整 cookie 文件。', count: lines.length, kept: summary });
+        continue;
+      }
       if (fs.existsSync(filePath)) {
         fs.copyFileSync(filePath, `${filePath}.bak`);
       }
       fs.writeFileSync(filePath, content, { mode: 0o600 });
-      synced.push({ platform: platformId, count: lines.length });
+      const summary = cookieFileSummary(filePath, platformId);
+      synced.push({ platform: platformId, count: lines.length, complete: summary.complete, domains: summary.domains, missing: summary.missing });
     } catch (error) {
       skipped.push({ platform: platformId, reason: `写入失败：${error.message}` });
     }

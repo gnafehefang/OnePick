@@ -1,4 +1,5 @@
-import { parseWithYtDlp, buildParseResponse, getCookieArgs, hasCookieFile, normalizeParsePreferences } from './shared.js';
+import { parseWithYtDlp, buildParseResponse, hasCookieFile, normalizeParsePreferences } from './shared.js';
+import { withRuntimeCookieArgs } from '../youtube-cookie-store.js';
 
 export function extractYoutubeId(url = '') {
   const text = String(url);
@@ -30,13 +31,13 @@ export async function parseYoutube({ url, platform, preferences }) {
 
   const candidateUrl = videoId ? `https://www.youtube.com/watch?v=${videoId}` : url;
   try {
-    const parsed = await parseWithYtDlp(candidateUrl, [
-      ...getCookieArgs('youtube'),
+    const parsed = await withRuntimeCookieArgs('youtube', cookieArgs => parseWithYtDlp(candidateUrl, [
+      ...cookieArgs,
       '--js-runtimes', 'node:/usr/local/bin/node',
       '--remote-components', 'ejs:github',
       '--referer', 'https://www.youtube.com/',
       '--user-agent', 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36'
-    ], resolvedPreferences);
+    ], resolvedPreferences, 'youtube'));
     const response = buildParseResponse({ parsed, platform, sourceUrl: url, resolvedUrl: candidateUrl, extra: { videoId, parser: 'youtube' } });
     response.items = response.items.map((item, index) => ({
       ...item,

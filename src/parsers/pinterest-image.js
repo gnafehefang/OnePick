@@ -82,8 +82,9 @@ export function buildPinterestImageResponse({ pinUrl, platform, title, cover, im
     const filename = `${safeName(title || 'pinterest')}-${index + 1}.${ext}`;
     return {
       type: 'image',
-      url: `/api/download?url=${encodeURIComponent(imgUrl)}&filename=${encodeURIComponent(filename)}`,
+      url: `/api/download?url=${encodeURIComponent(imgUrl)}&filename=${encodeURIComponent(filename)}&platform=pinterest`,
       sourceUrl: imgUrl,
+      platform: 'pinterest',
       filename,
       ext,
       width: null,
