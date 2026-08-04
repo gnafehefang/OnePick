@@ -813,7 +813,8 @@ app.post('/api/cookies/:platform', async (req, res, next) => {
     if (platformId === 'youtube') {
       const promoted = await promoteYoutubeCandidate(content, {
         cookieDir: cookieDirPath(),
-        validate: validateYoutubeCookieCandidate
+        validate: validateYoutubeCookieCandidate,
+        source: 'manual-api'
       });
       appendHistory({ kind: 'cookie', ok: true, platform: platformId, title: 'validated cookie promoted' });
       res.json({ ok: true, platform: platformId, configured: true, validated: true, count: promoted.summary.count });
@@ -1150,7 +1151,14 @@ function scheduleCookieCloudSync() {
       if (!cur.enabled || !normalizeInterval(cur.intervalMinutes)) { scheduleCookieCloudSync(); return; }
       const result = await runCookieCloudSync(cur);
       writeCookieCloudConfig({ ...cur, lastSync: new Date().toISOString(), lastResult: { ok: true, synced: result.synced, skipped: result.skipped, auto: true } });
-      appendHistory({ kind: 'cookiecloud', ok: true, title: `定时同步 (${result.synced.length} 平台)` });
+      appendHistory({
+        kind: 'cookiecloud', ok: true,
+        title: `定时同步 (${result.synced.length} 平台)`,
+        platform: result.youtubePromotion ? 'youtube' : undefined,
+        cookieCount: result.youtubePromotion?.count,
+        cookiePromotion: result.youtubePromotion?.ok ?? null,
+        cookiePromotionSource: result.youtubePromotion?.ok ? 'cookiecloud' : undefined
+      });
     } catch (error) {
       const cur = readCookieCloudConfig();
       writeCookieCloudConfig({ ...cur, lastResult: { ok: false, error: error.message, auto: true } });
@@ -1176,9 +1184,10 @@ async function runCookieCloudSync(config) {
       const content = fs.readFileSync(path.join(cookieDirPath(), 'youtube.source.txt'), 'utf8');
       const promoted = await promoteYoutubeCandidate(content, {
         cookieDir: cookieDirPath(),
-        validate: validateYoutubeCookieCandidate
+        validate: validateYoutubeCookieCandidate,
+        source: 'cookiecloud'
       });
-      result.youtubePromotion = { ok: true, count: promoted.summary.count };
+      result.youtubePromotion = { ok: true, count: promoted.summary.count, sha256: promoted.sha256 };
     } catch (error) {
       result.youtubePromotion = { ok: false, errorClass: error.errorClass || 'validation-error', error: error.message };
       result.skipped.push({ platform: 'youtube', reason: error.message });
@@ -1711,6 +1720,26 @@ async function downloadYtDlpToFile(sourceUrl, preferences) {
         throw error;
       }
     }
+    // iOS Photos uses the MP4 creation_time tag for its album ordering. yt-dlp outputs
+    // frequently retain the source publish time, so normalize every shortcut video at download time.
+    if (prefs.mode !== 'audio') {
+      const datedPath = path.join(tempDir, 'downloaded-now.mp4');
+      const creationTime = new Date().toISOString();
+      await execFileAsync('ffmpeg', [
+        '-hide_banner', '-y', '-i', streamPath,
+        '-map', '0:v:0', '-map', '0:a?',
+        '-c', 'copy', '-map_metadata', '-1',
+        '-metadata', `creation_time=${creationTime}`,
+        '-movflags', 'use_metadata_tags+faststart',
+        datedPath
+      ], { cwd: path.join(__dirname, '..'), timeout: 90000, maxBuffer: 2 * 1024 * 1024 });
+      if (fs.statSync(datedPath).size > maxYtDlpFileBytes) {
+        const error = new Error('媒体文件超过大小限制。');
+        error.statusCode = 413;
+        throw error;
+      }
+      streamPath = datedPath;
+    }
     return { path: streamPath, tempDir, extension, mode: prefs.mode };
   } catch (error) {
     fs.rmSync(tempDir, { recursive: true, force: true });
@@ -1737,6 +1766,7 @@ async function streamYtDlpDownload({ sourceUrl, filename, preferences, req, res,
       res.setHeader('Content-Length', String(fs.statSync(streamPath).size));
       res.setHeader('Content-Disposition', contentDisposition(safeFilename));
       res.setHeader('Cache-Control', 'private, max-age=0, no-store');
+      if (prefs.mode !== 'audio') res.setHeader('X-OnePick-Creation-Time', 'download-time');
       await pipeline(fs.createReadStream(streamPath), res);
       const clientMeta = parseClientMeta(req.query?.clientMeta);
     appendHistory({ kind: 'ytdlp', ok: true, durationMs: Date.now() - started, processDurationMs: Date.now() - started, mediaDuration: Number(req.query?.mediaDuration || 0) || null, platform: platform.id, title: safeFilename, sourceUrl, clientMeta, videoId: clientMeta?.videoId || facebookVideoIdFromAny(sourceUrl) || undefined, quality: String(req.query?.quality || clientMeta?.qualityPreference || '') || undefined, trigger: clientMeta?.trigger || undefined });

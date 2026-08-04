@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { createHash } from 'node:crypto';
 import {
   youtubeCookiePaths,
   inspectYoutubeCookieText,
@@ -20,8 +21,10 @@ assert.deepEqual(inspectYoutubeCookieText(incomplete).missing.sort(), required.s
 assert.equal(inspectYoutubeCookieText(complete).complete, true);
 
 const paths = youtubeCookiePaths(root);
+assert.equal(activeYoutubeMasterPath(root), '', 'a stale or incomplete master must not be used merely because it exists');
 fs.writeFileSync(paths.master, complete, { mode: 0o600 });
-assert.equal(activeYoutubeMasterPath(root), paths.master, 'verified master must take precedence over legacy cookie');
+fs.writeFileSync(paths.status, JSON.stringify({ validation: { ok: true }, sha256: createHash('sha256').update(complete).digest('hex') }));
+assert.equal(activeYoutubeMasterPath(root), paths.master, 'verified complete master must take precedence over legacy cookie');
 const original = fs.readFileSync(paths.master, 'utf8');
 
 await assert.rejects(
@@ -36,9 +39,12 @@ await assert.rejects(
 );
 assert.equal(fs.readFileSync(paths.master, 'utf8'), original, 'failed validation must not replace master');
 
-const promoted = complete.replace('value-SID', 'promoted-SID');
-await promoteYoutubeCandidate(promoted, { cookieDir: root, validate: async () => ({ ok: true }) });
+  const promoted = complete.replace('value-SID', 'promoted-SID');
+const promotion = await promoteYoutubeCandidate(promoted, { cookieDir: root, source: 'cookiecloud', validate: async () => ({ ok: true }) });
 assert.equal(fs.readFileSync(paths.master, 'utf8'), promoted, 'valid candidate must be promoted');
+const status = JSON.parse(fs.readFileSync(paths.status, 'utf8'));
+assert.equal(status.promotionSource, 'cookiecloud', 'master status must record promotion source');
+assert.equal(status.sha256, promotion.sha256, 'master status hash must identify the promoted content');
 assert.equal(fs.existsSync(paths.candidate), false, 'candidate must be removed after validation');
 
 const masterBeforeRuntime = fs.readFileSync(paths.master, 'utf8');

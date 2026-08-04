@@ -40,19 +40,34 @@ function atomicWrite(filePath, content, mode = 0o600) {
   fs.renameSync(temp, filePath);
 }
 
+function verifiedMasterIsUsable(masterPath, statusPath) {
+  try {
+    const content = fs.readFileSync(masterPath, 'utf8');
+    const summary = inspectYoutubeCookieText(content);
+    if (!summary.complete) return false;
+    const status = JSON.parse(fs.readFileSync(statusPath, 'utf8'));
+    const actualSha256 = crypto.createHash('sha256').update(content).digest('hex');
+    return status?.validation?.ok === true && status?.sha256 === actualSha256;
+  } catch {
+    return false;
+  }
+}
+
 export function activeYoutubeMasterPath(cookieDir = process.env.COOKIE_DIR || '/app/cookies') {
   const paths = youtubeCookiePaths(cookieDir);
-  for (const filePath of [paths.master, paths.legacy]) {
-    try {
-      if (fs.statSync(filePath).size > 0) return filePath;
-    } catch { /* continue */ }
+  if (verifiedMasterIsUsable(paths.master, paths.status)) return paths.master;
+  // Legacy imports predate the verified-master protocol; only use a structurally complete file.
+  try {
+    return inspectYoutubeCookieText(fs.readFileSync(paths.legacy, 'utf8')).complete ? paths.legacy : '';
+  } catch {
+    return '';
   }
-  return '';
 }
 
 export async function promoteYoutubeCandidate(content, {
   cookieDir = process.env.COOKIE_DIR || '/app/cookies',
-  validate
+  validate,
+  source = 'unknown'
 } = {}) {
   const summary = inspectYoutubeCookieText(content);
   if (!summary.complete) {
@@ -78,16 +93,18 @@ export async function promoteYoutubeCandidate(content, {
     error.errorClass = result?.errorClass || 'validation-error';
     throw error;
   }
+  const sha256 = crypto.createHash('sha256').update(content).digest('hex');
   atomicWrite(paths.master, content);
   atomicWrite(paths.status, JSON.stringify({
     promotedAt: new Date().toISOString(),
+    promotionSource: String(source || 'unknown').slice(0, 80),
     count: summary.count,
     domains: summary.domains,
     names: summary.names,
-    sha256: crypto.createHash('sha256').update(content).digest('hex'),
+    sha256,
     validation: { ok: true }
   }, null, 2) + '\n');
-  return { promoted: true, summary, master: paths.master, candidate: candidatePath };
+  return { promoted: true, summary, sha256, master: paths.master, candidate: candidatePath };
 }
 
 export async function withRuntimeCookieArgs(platformId, callback, {

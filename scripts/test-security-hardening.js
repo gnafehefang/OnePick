@@ -60,6 +60,8 @@ assert.equal(fs.readFileSync(new URL('../src/parsers/generic.js', import.meta.ur
 assert.equal(fs.readFileSync(new URL('../src/server.js', import.meta.url), 'utf8').includes('isGenericYtDlpSource'), true, 'generic HLS must be explicitly permitted by yt-dlp download validation');
 assert.equal(fs.readFileSync(new URL('../src/server.js', import.meta.url), 'utf8').includes("tokens['remote-addr']"), true, 'Morgan must use the official remote-addr token name');
 assert.equal(fs.readFileSync(new URL('../src/server.js', import.meta.url), 'utf8').includes("error?.name !== 'AbortError'"), true, 'AbortError must fail closed instead of returning original MP4');
+assert.equal(fs.readFileSync(new URL('../src/server.js', import.meta.url), 'utf8').includes("'downloaded-now.mp4'"), true, 'yt-dlp shortcut video must rewrite MP4 creation time for Photos ordering');
+assert.equal(fs.readFileSync(new URL('../src/server.js', import.meta.url), 'utf8').includes("X-OnePick-Creation-Time', 'download-time'"), true, 'yt-dlp shortcut response must identify download-time metadata');
 
 const localDirect = await listen((_req, res) => res.end('not used'));
 try {
