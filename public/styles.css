@@ -405,6 +405,8 @@ summary { cursor: pointer; color: var(--mint-ink); font-weight: 700; }
 .tag.dot-warn { color: #a86212; background: #ffe7c2; border-color: transparent; }
 .tag.dot-muted { color: #999; }
 .platform-card-actions { display: flex; flex-wrap: wrap; gap: 8px; }
+.platform-card-actions .mini-button { flex: 1 1 0; min-width: 0; text-align: center; }
+.platform-card-actions .mini-button:only-child { flex: 0 1 auto; }
 .hint-list { margin: 12px 0 0; padding-left: 18px; color: var(--muted); font-size: 12.5px; line-height: 1.7; }
 .hint-list li { margin: 0; }
 .hint-list code { font-size: 11.5px; padding: 1px 5px; }

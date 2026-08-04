@@ -13,7 +13,8 @@ export function youtubeCookiePaths(cookieDir = process.env.COOKIE_DIR || '/app/c
     legacy: path.join(cookieDir, 'youtube.txt'),
     candidate: path.join(cookieDir, 'youtube.candidate.txt'),
     master: path.join(cookieDir, 'youtube.master.txt'),
-    status: path.join(cookieDir, 'youtube.master.json')
+    status: path.join(cookieDir, 'youtube.master.json'),
+    lastCheck: path.join(cookieDir, 'youtube.last-check.json')
   };
 }
 
@@ -89,6 +90,15 @@ export async function promoteYoutubeCandidate(content, {
     fs.rmSync(candidateDir, { recursive: true, force: true });
   }
   if (!result?.ok) {
+    const sha256 = crypto.createHash('sha256').update(content).digest('hex');
+    atomicWrite(paths.lastCheck, JSON.stringify({
+      checkedAt: new Date().toISOString(),
+      source: String(source || 'unknown').slice(0, 80),
+      sha256,
+      count: summary.count,
+      complete: summary.complete,
+      validation: { ok: false, errorClass: result?.errorClass || 'validation-error' }
+    }, null, 2) + '\n');
     const error = new Error(`YouTube Cookie 候选验证失败：${result?.errorClass || 'unknown'}`);
     error.errorClass = result?.errorClass || 'validation-error';
     throw error;

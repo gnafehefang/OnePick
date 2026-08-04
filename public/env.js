@@ -192,13 +192,15 @@ function renderPlatforms(data) {
   const platforms = (data.platforms || []).slice().sort((a, b) =>
     String(a.name || '').localeCompare(String(b.name || ''), 'zh-Hans-CN', { sensitivity: 'base' }));
   platformsEl.innerHTML = platforms.map(platform => {
-    const hasCookie = !!data.cookies?.[platform.id];
+    const hasCookie = platform.id === 'youtube' ? platform.cookieState !== 'unconfigured' : !!data.cookies?.[platform.id];
     const needCookie = platform.requiresCookie === true;
-    // YouTube Cookie is not protocol-mandatory, but an invalid/missing verified master is actionable
-    // because its extractor is commonly subject to bot-check. Do not present that as "not needed".
-    const youtubeCookieProblem = platform.id === 'youtube' && !hasCookie;
-    const cookieState = hasCookie ? 'ok' : ((needCookie || youtubeCookieProblem) ? 'warn' : 'muted');
-    const cookieText = hasCookie ? 'Cookie 已配置' : (needCookie ? '需 Cookie' : (youtubeCookieProblem ? 'Cookie 无有效验证' : '无需 Cookie'));
+    const youtubeCookieState = platform.id === 'youtube' ? (platform.cookieState || 'unconfigured') : '';
+    const cookieState = platform.id === 'youtube'
+      ? (youtubeCookieState === 'valid' ? 'ok' : (youtubeCookieState === 'invalid' ? 'warn' : 'muted'))
+      : (hasCookie ? 'ok' : (needCookie ? 'warn' : 'muted'));
+    const cookieText = platform.id === 'youtube'
+      ? (platform.cookieStatusLabel || '未配置')
+      : (hasCookie ? 'Cookie 已配置' : (needCookie ? '需 Cookie' : '无需 Cookie'));
     return `
     <article class="platform-card">
       <button class="proxy-mode-pill ${proxyModeLabel(platform, data).cls}" data-proxy-mode="${escapeHtml(platform.id)}" data-mode="${proxyModeLabel(platform, data).mode}" title="点击切换：自动/直连/代理">${escapeHtml(proxyModeLabel(platform, data).text)}</button>
@@ -647,16 +649,14 @@ async function clearCookie() {
 async function checkCookie(platformId) {
   try {
     if (platformId === 'youtube') {
-      const response = await fetch('/api/cookiecloud/inspect?platform=youtube', { credentials: 'same-origin' });
+      const response = await fetch('/api/cookies/youtube/check', { credentials: 'same-origin' });
       const payload = await response.json().catch(() => ({}));
-      if (!response.ok || !payload.ok) throw new Error(payload.error || `HTTP ${response.status}`);
-      const local = payload.local || {};
-      const source = payload.source || {};
-      const preface = [
-        local.exists ? '当前已验证 YouTube Cookie 可用。' : '当前没有可用的已验证 YouTube Cookie；解析会触发 bot-check。',
-        source.complete ? 'CookieCloud 当前源关键登录态齐全。' : 'CookieCloud 当前源缺少关键登录态，不能晋升。'
-      ].join('\n');
-      showInfoDialog('YouTube CookieCloud 检查', `${preface}\n\n${cookieInspectText(payload)}`);
+      const state = payload.state || {};
+      const result = response.ok && payload.ok
+        ? `Cookie 有效。已通过当前代理出口的 yt-dlp 真实验证。\n条目数：${payload.count || state.count || 0}`
+        : `Cookie 无效。${payload.error || state.reason || '未通过当前代理出口的验证。'}`;
+      showInfoDialog('YouTube Cookie 检查', result);
+      loadEnvView(true);
       return;
     }
     const response = await fetch(`/api/cookies/${encodeURIComponent(platformId)}/check`);

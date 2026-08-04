@@ -17,7 +17,7 @@ import { parseMedia, listSupportedPlatforms, extractFirstUrl, detectPlatform } f
 import { assertPublicUrl, fetchPublicUrl, getCookieStatus, resolveRedirects, getCookieHeader, assertCookieForDownload, getDownloadCookieRequirementStatus, requiresCookieForDownload, getProxyStatus, getProxyConfig, validateProxyUrl, proxyConfigPath, getProxyArgs, normalizeParsePreferences, PLATFORM_PATTERNS, getPlatformProxyModes, defaultProxyModeForPlatform, shouldUseProxyForPlatform, downloadCookiePlatformForUrl, mediaRequestHeaders, hostMatchesDomain } from './parsers/shared.js';
 import { YTDLP_PLATFORMS, ytdlpDownloadExtraArgs } from './parsers/ytdlp-platforms.js';
 import { readCookieCloudConfig, writeCookieCloudConfig, clearCookieCloudConfig, syncCookieCloudToFiles, buildPlatformDomainMap, fetchCookieCloud } from './cookiecloud.js';
-import { promoteYoutubeCandidate, withRuntimeCookieArgs, activeYoutubeMasterPath } from './youtube-cookie-store.js';
+import { promoteYoutubeCandidate, withRuntimeCookieArgs, activeYoutubeMasterPath, inspectYoutubeCookieText, youtubeCookiePaths, YOUTUBE_REQUIRED_COOKIE_NAMES } from './youtube-cookie-store.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -734,9 +734,35 @@ const importantCookieNames = {
   douyin: ['sessionid', 'sid_guard', 'uid_tt', 'sid_tt', 'passport_csrf_token', 's_v_web_id', '__ac_nonce', '__ac_signature'],
   xiaohongshu: ['a1', 'web_session', 'webId', 'websectiga', 'gid'],
   kuaishou: ['did', 'userId', 'kuaishou.server_st', 'kuaishou.api_st'],
-  youtube: ['SID', 'HSID', 'SSID', 'APISID', 'SAPISID', '__Secure-1PSID', '__Secure-3PSID', '__Secure-1PSIDTS', '__Secure-3PSIDTS', 'LOGIN_INFO'],
+  youtube: YOUTUBE_REQUIRED_COOKIE_NAMES,
   twitter: ['auth_token', 'ct0', 'twid']
 };
+
+function youtubeCookieRuntimeStatus() {
+  const paths = youtubeCookiePaths(cookieDirPath());
+  const active = activeYoutubeMasterPath(cookieDirPath());
+  let status = null;
+  let lastCheck = null;
+  try { status = JSON.parse(fs.readFileSync(paths.status, 'utf8')); } catch {}
+  try { lastCheck = JSON.parse(fs.readFileSync(paths.lastCheck, 'utf8')); } catch {}
+  const summaryFor = filePath => {
+    try { return inspectYoutubeCookieText(fs.readFileSync(filePath, 'utf8')); } catch { return null; }
+  };
+  const sourceSummary = summaryFor(path.join(cookieDirPath(), 'youtube.source.txt'));
+  const configured = summaryFor(paths.master) || summaryFor(paths.legacy) || summaryFor(paths.candidate) || sourceSummary;
+  if (!configured) return { state: 'unconfigured', label: '未配置', configured: false, active: false };
+  if (active && status?.validation?.ok) return {
+    state: 'valid', label: 'Cookie 有效', configured: true, active: true,
+    count: status.count || configured.count, validatedAt: status.promotedAt || null, source: status.promotionSource || null
+  };
+  const structurallyComplete = configured.complete || sourceSummary?.complete;
+  return {
+    state: structurallyComplete ? 'configured' : 'invalid',
+    label: structurallyComplete ? 'Cookie 已配置' : 'Cookie 无效', configured: true, active: false,
+    count: configured.count, missing: configured.missing, validatedAt: status?.promotedAt || lastCheck?.checkedAt || null,
+    reason: structurallyComplete ? (lastCheck?.validation?.errorClass || '尚未调用验证') : '缺少关键登录态'
+  };
+}
 
 function inspectCookieFile(platformId) {
   const filePath = platformId === 'youtube' ? activeYoutubeMasterPath(cookieDirPath()) : cookieFilePath(platformId);
@@ -762,8 +788,31 @@ function inspectCookieFile(platformId) {
   return { exists: true, count: names.length, validLines, invalidLines, domains: [...new Set(domains)].sort(), names, important, missingImportant, hint };
 }
 
-app.get('/api/cookies/:platform/check', (req, res, next) => {
+async function checkYoutubeCookieConfiguration() {
+  const paths = youtubeCookiePaths(cookieDirPath());
+  const candidates = [paths.candidate, path.join(cookieDirPath(), 'youtube.source.txt'), paths.master, paths.legacy];
+  const filePath = candidates.find(candidate => fs.existsSync(candidate));
+  if (!filePath) return { ok: false, state: youtubeCookieRuntimeStatus(), error: '未配置 YouTube Cookie。' };
+  const content = fs.readFileSync(filePath, 'utf8');
   try {
+    const promoted = await promoteYoutubeCandidate(content, {
+      cookieDir: cookieDirPath(), validate: validateYoutubeCookieCandidate, source: 'manual-check'
+    });
+    runtimePayloadCache = null;
+    return { ok: true, state: youtubeCookieRuntimeStatus(), count: promoted.summary.count };
+  } catch (error) {
+    runtimePayloadCache = null;
+    return { ok: false, state: youtubeCookieRuntimeStatus(), error: error.message, errorClass: error.errorClass || 'validation-error' };
+  }
+}
+
+app.get('/api/cookies/:platform/check', async (req, res, next) => {
+  try {
+    if (String(req.params.platform) === 'youtube') {
+      const result = await checkYoutubeCookieConfiguration();
+      res.status(result.ok ? 200 : 422).json({ platform: 'youtube', ...result });
+      return;
+    }
     const result = inspectCookieFile(req.params.platform);
     res.json({ ok: result.exists && result.validLines > 0 && result.invalidLines === 0, platform: req.params.platform, ...result });
   } catch (error) {
@@ -981,20 +1030,25 @@ app.get('/api/runtime', async (req, res) => {
     commandVersion('yt-dlp'),
     commandVersion('ffmpeg', ['-version'])
   ]);
+  const youtubeCookie = youtubeCookieRuntimeStatus();
+  const platforms = listSupportedPlatforms().map(platform => platform.id === 'youtube'
+    ? { ...platform, cookieConfigured: youtubeCookie.configured, cookieState: youtubeCookie.state, cookieStatusLabel: youtubeCookie.label, cookieValidatedAt: youtubeCookie.validatedAt || null }
+    : platform);
   const payload = {
     service: 'OnePick Tools',
     version: appVersion,
     node: process.version,
     env: process.env.NODE_ENV || 'development',
     cookieDir: process.env.COOKIE_DIR || '/app/cookies',
-    cookies: getCookieStatus(),
+    cookies: { ...getCookieStatus(), youtube: youtubeCookie.configured },
+    youtubeCookie,
     proxy: getProxyStatus(),
     ytdlpAutoUpdate: readYtDlpAutoConfig(),
     componentUpdates: readComponentUpdateConfig(),
     downloadCookieRequirements: getDownloadCookieRequirementStatus(),
     cookieCloud: cookieCloudRuntimeStatus(),
     tools: { ytDlp: ytDlpVersion, ffmpeg: ffmpegVersion },
-    platforms: listSupportedPlatforms(),
+    platforms,
     platformStatus: platformHistoryStatus(),
     time: new Date().toISOString()
   };
