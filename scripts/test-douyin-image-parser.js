@@ -5,16 +5,25 @@ import { listSupportedPlatforms } from '../src/parsers/index.js';
 
 assert.equal(listSupportedPlatforms().find(platform => platform.id === 'douyin')?.parser, 'dedicated');
 
-const imageUrl1 = 'https://p3-pc-sign.douyinpic.com/tos-cn-i-0813/one?x=1';
-const imageUrl1Fallback = 'https://p3-pc-sign.douyinpic.com/tos-cn-i-0813/one.webp?x=1';
-const imageUrl2 = 'https://p9-pc-sign.douyinpic.com/tos-cn-i-0813/two.jpg?x=2';
+// Douyin's download_url_list can contain a rendered image with a platform/author
+// watermark. url_list is the original image candidate and must be selected first.
+const imageUrl1Original = 'https://p3-pc-sign.douyinpic.com/tos-cn-i-0813/one-original?x=1';
+const imageUrl1OriginalFallback = 'https://p3-pc-sign.douyinpic.com/tos-cn-i-0813/one-original.webp?x=1';
+const imageUrl1Watermarked = 'https://p3-pc-sign.douyinpic.com/tos-cn-i-0813/one-watermarked?x=1';
+const imageUrl2Original = 'https://p9-pc-sign.douyinpic.com/tos-cn-i-0813/two-original.jpg?x=2';
+const imageUrl2Watermarked = 'https://p9-pc-sign.douyinpic.com/tos-cn-i-0813/two-watermarked.jpg?x=2';
 const parsed = extractAwemeFromJson({
   aweme_detail: {
     aweme_id: '7674502439499794033',
     desc: '摩托车攻略',
     images: [
-      { width: 1080, height: 1440, url_list: [imageUrl1, imageUrl1Fallback], download_url_list: [imageUrl1, imageUrl1Fallback] },
-      { width: 1080, height: 1440, url_list: [imageUrl2], download_url_list: [imageUrl2] }
+      {
+        width: 1080,
+        height: 1440,
+        url_list: [imageUrl1Original, imageUrl1OriginalFallback],
+        download_url_list: [imageUrl1Watermarked]
+      },
+      { width: 1080, height: 1440, url_list: [imageUrl2Original], download_url_list: [imageUrl2Watermarked] }
     ]
   }
 }, { engine: 'douyin-direct' });
@@ -22,10 +31,10 @@ const parsed = extractAwemeFromJson({
 assert.ok(parsed, 'Douyin image notes must produce a parsed result');
 assert.equal(parsed.items.length, 2);
 assert.deepEqual(parsed.items.map(item => item.type), ['image', 'image']);
-assert.deepEqual(parsed.items.map(item => item.url), [imageUrl1, imageUrl2]);
+assert.deepEqual(parsed.items.map(item => item.url), [imageUrl1Original, imageUrl2Original]);
 assert.match(parsed.items[0].filename, /^摩托车攻略-1\.jpg$/);
-assert.deepEqual(parsed.items[0].urlCandidates, [imageUrl1, imageUrl1Fallback]);
-assert.equal(parsed.cover, imageUrl1);
+assert.deepEqual(parsed.items[0].urlCandidates, [imageUrl1Original, imageUrl1OriginalFallback, imageUrl1Watermarked]);
+assert.equal(parsed.cover, imageUrl1Original);
 
 const response = buildParseResponse({
   parsed,

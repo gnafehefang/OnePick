@@ -85,7 +85,7 @@ export function extractAwemeFromJson(json, { engine = 'douyin-direct' } = {}) {
   if (!aweme || typeof aweme !== 'object') return null;
   const title = aweme.desc || aweme.preview_title || aweme.aweme_id || 'douyin-media';
   const images = (Array.isArray(aweme.images) ? aweme.images : Array.isArray(aweme.image_list) ? aweme.image_list : [])
-    .map(image => pickUrlCandidates(image?.download_url_list, image?.url_list, image?.url))
+    .map(image => pickUrlCandidates(image?.url_list, image?.download_url_list, image?.url))
     .filter(urls => urls.length);
   if (images.length) {
     return {
