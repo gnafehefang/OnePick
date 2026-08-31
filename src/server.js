@@ -1640,6 +1640,11 @@ function tagDownloadError(error, reason) {
   return error;
 }
 
+function createUpstreamReadError(error) {
+  const wrapped = error instanceof Error ? error : new Error(String(error || '下载源读取失败。'));
+  return tagDownloadError(wrapped, 'upstream-error');
+}
+
 function markDownloadErrorTermination(telemetry, error) {
   if (!telemetry || telemetry._terminated) return;
   if (error?.statusCode === 413) {
@@ -1870,7 +1875,7 @@ const runLimitedMp4Normalization = withAsyncConcurrencyLimit(maxConcurrentMp4Nor
 
 function isMp4NormalizationFallbackError(error) {
   const code = String(error?.code || '');
-  return !error?.statusCode && error?.name !== 'AbortError' && code !== '20' && code !== 'ABORT_ERR' && code !== 'ERR_STREAM_PREMATURE_CLOSE';
+  return !error?.onepickTerminationReason && !error?.statusCode && error?.name !== 'AbortError' && code !== '20' && code !== 'ABORT_ERR' && code !== 'ERR_STREAM_PREMATURE_CLOSE';
 }
 
 async function createTelemetryLimitedUpstreamStream(response, limit, controller, telemetry, transferStartedAt, label = '下载文件') {
@@ -1878,7 +1883,9 @@ async function createTelemetryLimitedUpstreamStream(response, limit, controller,
   recordDownloadBytes(telemetry, { declaredBytes: response.headers.get('content-length') });
   if (!response.body) throw new Error('下载源没有可读内容。');
   let total = 0;
-  return Readable.fromWeb(response.body).pipe(new Transform({
+  const upstream = Readable.fromWeb(response.body);
+  upstream.on('error', createUpstreamReadError);
+  return upstream.pipe(new Transform({
     transform(chunk, _encoding, callback) {
       recordDownloadStage(telemetry, 'firstByteMs', performance.now() - transferStartedAt);
       total += chunk.length;

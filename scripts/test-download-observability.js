@@ -65,6 +65,9 @@ assert.match(server, /app\.get\('\/api\/shortcut\/browser-download'[\s\S]*?trans
 assert.match(server, /createTelemetryLimitedUpstreamStream/, 'Twitter MP4 normalization must collect upstream stream telemetry');
 assert.match(server, /pipeLocalFileToResponse\(outputPath, res, controller, telemetry\)/, 'Twitter MP4 output must collect downstream transfer telemetry');
 assert.match(server, /throw tagDownloadError\(error, 'upstream-error'\)/, 'upstream fetch/read errors must be classified explicitly');
+assert.match(server, /function createUpstreamReadError\([\s\S]*?tagDownloadError\(wrapped, 'upstream-error'\)/, 'Readable.fromWeb errors must be classified as upstream errors');
+assert.match(server, /upstream\.on\('error', createUpstreamReadError\)/, 'MP4 upstream streams must classify source errors before fallback handling');
+assert.match(server, /return !error\?\.onepickTerminationReason && !error\?\.statusCode/, 'MP4 fallback must reject classified upstream failures before serving a partial file');
 assert.match(server, /await finishResponse\(res, controller, telemetry\)/, 'completion must be recorded only after response finish');
 assert.match(server, /pipeLocalFileToResponse[\s\S]*?const terminalReason = error\?\.onepickTerminationReason \|\| 'downstream-write-error'/, 'MP4 local response write failures must be classified as downstream-write-error');
 assert.match(server, /validation-error/, 'pre-upstream validation failures must not be mislabeled as upstream failures');

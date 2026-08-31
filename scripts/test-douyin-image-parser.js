@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import { buildParseResponse } from '../src/parsers/shared.js';
 import { extractAwemeFromJson } from '../src/parsers/douyin.js';
 import { listSupportedPlatforms } from '../src/parsers/index.js';
+import { candidateUrlsForItem } from '../src/media-download-utils.js';
 
 assert.equal(listSupportedPlatforms().find(platform => platform.id === 'douyin')?.parser, 'dedicated');
 
@@ -35,6 +36,28 @@ assert.deepEqual(parsed.items.map(item => item.url), [imageUrl1Original, imageUr
 assert.match(parsed.items[0].filename, /^摩托车攻略-1\.jpg$/);
 assert.deepEqual(parsed.items[0].urlCandidates, [imageUrl1Original, imageUrl1OriginalFallback, imageUrl1Watermarked]);
 assert.equal(parsed.cover, imageUrl1Original);
+assert.deepEqual(candidateUrlsForItem(parsed.items[0]), [imageUrl1Original, imageUrl1OriginalFallback, imageUrl1Watermarked]);
+
+const fallbackOnly = extractAwemeFromJson({
+  aweme_detail: {
+    aweme_id: '7674502439499794034',
+    images: [{ download_url_list: [imageUrl1Watermarked] }]
+  }
+});
+assert.equal(fallbackOnly.items[0].url, imageUrl1Watermarked, 'download_url_list must remain the fallback when url_list is absent');
+
+const originalUrls = Array.from({ length: 5 }, (_, index) => `https://p3-pc-sign.douyinpic.com/tos-cn-i-0813/original-${index + 1}.jpg`);
+const fallbackAfterFiveOriginals = extractAwemeFromJson({
+  aweme_detail: {
+    aweme_id: '7674502439499794035',
+    images: [{ url_list: originalUrls, download_url_list: [imageUrl1Watermarked] }]
+  }
+});
+assert.deepEqual(
+  candidateUrlsForItem(fallbackAfterFiveOriginals.items[0]),
+  [...originalUrls.slice(0, 4), imageUrl1Watermarked],
+  'candidate limit must retain a download_url_list fallback after original url_list candidates'
+);
 
 const response = buildParseResponse({
   parsed,
