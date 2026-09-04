@@ -1,4 +1,5 @@
-import { buildParseResponse, normalizeParsePreferences } from './shared.js';
+import { buildParseResponse, normalizeParsePreferences, parseWithYtDlp } from './shared.js';
+import { ytdlpExtraArgs } from './ytdlp-platforms.js';
 
 export function extractTwitterStatusId(url = '') {
   const text = String(url || '');
@@ -204,7 +205,7 @@ async function fetchVxTwitterTweet(url, statusId) {
   try { return JSON.parse(text); } catch { throw new Error('vxtwitter did not return JSON'); }
 }
 
-export async function parseTwitter({ url, platform, preferences }) {
+export async function parseTwitter({ url, platform, preferences, parseYtDlp = parseWithYtDlp } = {}) {
   const resolvedPreferences = normalizeParsePreferences(preferences);
   twitterPreferenceError(resolvedPreferences);
   const statusId = extractTwitterStatusId(url);
@@ -240,6 +241,18 @@ export async function parseTwitter({ url, platform, preferences }) {
       parsed = extractVxTwitterDetails(payload, resolvedPreferences);
     } catch (error) {
       syndicationErrors.push(`vxtwitter: ${error.message}`);
+    }
+  }
+
+  if (!parsed?.items.length) {
+    try {
+      // The two anonymous metadata adapters are intentionally best-effort: their
+      // payloads vary by post type, region and upstream availability. yt-dlp's
+      // maintained Twitter extractor is the final in-process fallback and uses
+      // OnePick's configured per-platform proxy chain (never X account cookies).
+      parsed = await parseYtDlp(url, ytdlpExtraArgs('twitter'), resolvedPreferences, 'twitter');
+    } catch (error) {
+      syndicationErrors.push(`yt-dlp: ${error.message}`);
     }
   }
 
