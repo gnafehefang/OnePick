@@ -251,6 +251,17 @@ export async function parseTwitter({ url, platform, preferences, parseYtDlp = pa
       // maintained Twitter extractor is the final in-process fallback and uses
       // OnePick's configured per-platform proxy chain (never X account cookies).
       parsed = await parseYtDlp(url, ytdlpExtraArgs('twitter'), resolvedPreferences, 'twitter');
+      if (parsed?.items?.length) {
+        const filenameFor = (item, index) => item?.filename || `twitter-${index + 1}.${item?.ext || 'mp4'}`;
+        parsed = {
+          ...parsed,
+          items: parsed.items.map((item, index) => ({
+            ...item,
+            sourceUrl: url,
+            url: `/api/ytdlp-download?source=${encodeURIComponent(url)}&filename=${encodeURIComponent(filenameFor(item, index))}&mode=${encodeURIComponent(resolvedPreferences.mode)}&quality=${encodeURIComponent(resolvedPreferences.quality)}`
+          }))
+        };
+      }
     } catch (error) {
       syndicationErrors.push(`yt-dlp: ${error.message}`);
     }

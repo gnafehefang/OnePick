@@ -126,7 +126,7 @@ try {
   };
 
   let fallbackUrl = '';
-  const parseWithYtDlp = async (candidateUrl, _args, _preferences, platformId) => {
+  const parseYtDlp = async (candidateUrl, _args, _preferences, platformId) => {
     fallbackUrl = candidateUrl;
     assert.equal(platformId, 'twitter');
     return {
@@ -150,10 +150,14 @@ try {
     url: tweetUrl,
     platform: detectPlatform(tweetUrl),
     preferences: { mode: 'video', quality: 'best' },
-    parseYtDlp: parseWithYtDlp
+    parseYtDlp: parseYtDlp
   });
   assert.equal(ytdlpFallback.engine, 'yt-dlp', 'both public metadata adapters failing must fall back to yt-dlp');
-  assert.equal(ytdlpFallback.items[0].url, 'https://video.twimg.com/ytdlp-fallback.mp4');
+  assert.match(ytdlpFallback.items[0].url, /^\/api\/ytdlp-download\?/, 'yt-dlp fallback media must use the yt-dlp download route, not a direct CDN fetch');
+  const fallbackDownloadUrl = new URL(ytdlpFallback.items[0].url, 'http://127.0.0.1');
+  assert.equal(fallbackDownloadUrl.searchParams.get('source'), tweetUrl, 'yt-dlp fallback download route must preserve the original status URL');
+  assert.equal(fallbackDownloadUrl.searchParams.get('mode'), 'video');
+  assert.equal(fallbackDownloadUrl.searchParams.get('quality'), 'best');
   assert.equal(fallbackUrl, tweetUrl, 'yt-dlp fallback must receive the original status URL');
   assert.equal(ytdlpFallbackCalls.length, 2, 'dedicated adapters must be tried before yt-dlp fallback');
 
