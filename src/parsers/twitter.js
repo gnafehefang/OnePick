@@ -248,8 +248,10 @@ export async function parseTwitter({ url, platform, preferences, parseYtDlp = pa
     try {
       // The two anonymous metadata adapters are intentionally best-effort: their
       // payloads vary by post type, region and upstream availability. yt-dlp's
-      // maintained Twitter extractor is the final in-process fallback and uses
-      // OnePick's configured per-platform proxy chain (never X account cookies).
+      // maintained Twitter extractor is the final parser-stage fallback. It uses
+      // OnePick's configured per-platform proxy chain without passing an X
+      // account Cookie; the returned same-origin download route subsequently
+      // applies the normal authenticated download policy where configured.
       parsed = await parseYtDlp(url, ytdlpExtraArgs('twitter'), resolvedPreferences, 'twitter');
       if (parsed?.items?.length) {
         const filenameFor = (item, index) => item?.filename || `twitter-${index + 1}.${item?.ext || 'mp4'}`;

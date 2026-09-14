@@ -126,8 +126,10 @@ try {
   };
 
   let fallbackUrl = '';
-  const parseYtDlp = async (candidateUrl, _args, _preferences, platformId) => {
+  let fallbackArgs = [];
+  const parseYtDlp = async (candidateUrl, args, _preferences, platformId) => {
     fallbackUrl = candidateUrl;
+    fallbackArgs = args;
     assert.equal(platformId, 'twitter');
     return {
       engine: 'yt-dlp',
@@ -159,6 +161,7 @@ try {
   assert.equal(fallbackDownloadUrl.searchParams.get('mode'), 'video');
   assert.equal(fallbackDownloadUrl.searchParams.get('quality'), 'best');
   assert.equal(fallbackUrl, tweetUrl, 'yt-dlp fallback must receive the original status URL');
+  assert.equal(fallbackArgs.includes('--cookies'), false, 'anonymous fallback parsing must not pass X cookies to yt-dlp');
   assert.equal(ytdlpFallbackCalls.length, 2, 'dedicated adapters must be tried before yt-dlp fallback');
 
   await assert.rejects(
