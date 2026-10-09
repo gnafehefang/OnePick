@@ -92,6 +92,24 @@ function pickDouyinImageUrlCandidates(image = {}) {
   return [...originalUrls, ...downloadUrls, ...directUrls];
 }
 
+function shareNoteAudioUrl(aweme, engine) {
+  if (engine !== 'douyin-share') return '';
+  try {
+    const play = aweme.video?.play_addr;
+    const wrapper = new URL(play?.url_list?.[0]);
+    const audio = wrapper.searchParams.get('video_id');
+    if (wrapper.protocol !== 'https:' || wrapper.hostname !== 'aweme.snssdk.com'
+      || wrapper.port || wrapper.username || wrapper.password || wrapper.pathname !== '/aweme/v1/playwm/'
+      || audio !== play.uri) return '';
+    const url = new URL(audio);
+    if (url.protocol !== 'https:' || url.username || url.password
+      || !/\.(?:mp3|m4a|aac|wav|ogg)$/i.test(url.pathname)) return '';
+    // Preserve the original opaque URL. The download boundary still performs
+    // public-address validation; metadata is not authorization to fetch it.
+    return audio;
+  } catch { return ''; }
+}
+
 export function extractAwemeFromJson(json, { engine = 'douyin-direct' } = {}) {
   const aweme = json?.aweme_detail || json?.aweme || json?.item || json?.data?.aweme_detail || json?.data;
   if (!aweme || typeof aweme !== 'object') return null;
@@ -107,7 +125,11 @@ export function extractAwemeFromJson(json, { engine = 'douyin-direct' } = {}) {
       music.play_addr,
       music.url,
       music.url_list,
-      aweme.music?.play_url?.url_list
+      aweme.music?.play_url?.url_list,
+      // Share SSR omits music.play_url for notes and stores the original
+      // audio URL in video.play_addr.uri (url_list is a broken playwm wrapper).
+      // Only accept explicit audio URLs, never a video ID or video payload.
+      [shareNoteAudioUrl(aweme, engine)]
     ));
     const audioExt = extFromMediaUrl(audioUrl) === 'jpg' ? 'm4a' : extFromMediaUrl(audioUrl);
     const audioItem = audioUrl ? {
@@ -164,6 +186,57 @@ export function extractAwemeFromJson(json, { engine = 'douyin-direct' } = {}) {
       platform: 'douyin'
     }]
   };
+}
+
+// The mobile share page exposes the same work in SSR JSON even when the
+// desktop detail endpoint rejects the request with Argus Uifid Not Found.
+// Parse JSON only: never evaluate upstream scripts or accept a different work.
+export function extractDouyinShareHtml(html, awemeId) {
+  const match = String(html).match(/window\._ROUTER_DATA\s*=\s*([\s\S]*?)<\/script\s*>/i);
+  if (!match) return null;
+  try {
+    const data = JSON.parse(match[1].trim().replace(/;\s*$/, ''));
+    for (const value of Object.values(data?.loaderData || {})) {
+      const info = value?.videoInfoRes;
+      if (info?.status_code !== 0 || !Array.isArray(info.item_list)) continue;
+      const aweme = info.item_list.find(item => String(item?.aweme_id) === String(awemeId));
+      if (aweme) return extractAwemeFromJson({ aweme_detail: aweme }, { engine: 'douyin-share' });
+    }
+  } catch { /* Missing or malformed SSR data is a bounded fallback failure. */ }
+  return null;
+}
+
+async function parseDouyinShare(awemeId) {
+  const attempt = { source: 'mobile-share' };
+  try {
+    const response = await fetch(`https://www.douyin.com/share/video/${awemeId}/`, {
+      headers: {
+        ...douyinHeaders(),
+        'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 Version/17.0 Mobile/15E148 Safari/604.1',
+        Accept: 'text/html'
+      },
+      redirect: 'manual',
+      signal: AbortSignal.timeout(15000)
+    });
+    attempt.status = response.status;
+    attempt.contentType = response.headers.get('content-type') || '';
+    if (!response.ok) { await response.body?.cancel(); return { ok: false, attempts: [attempt] }; }
+    // Bound decoded bytes too; Content-Length may be absent or compressed.
+    const chunks = [];
+    let bytes = 0;
+    for await (const chunk of response.body) {
+      bytes += chunk.length;
+      if (bytes > 2 * 1024 * 1024) throw new Error('share-body-limit');
+      chunks.push(chunk);
+    }
+    attempt.bodyBytes = bytes;
+    const parsed = extractDouyinShareHtml(Buffer.concat(chunks).toString('utf8'), awemeId);
+    return { ok: Boolean(parsed), parsed, attempts: [attempt] };
+  } catch (error) {
+    // Do not expose upstream HTML, cookies, signed URLs or transport error URLs.
+    attempt.error = error.name === 'TimeoutError' ? 'share-timeout' : 'share-unavailable';
+    return { ok: false, attempts: [attempt] };
+  }
 }
 
 function netscapeCookiesToPlaywright(filePath) {
@@ -309,6 +382,17 @@ export async function parseDouyin({ url, platform }) {
         extra: { douyinId, redirectChain: resolved.chain, parser: 'douyin-direct', diagnostics: direct.attempts }
       });
     }
+    const share = await parseDouyinShare(douyinId);
+    if (share.ok) {
+      return buildParseResponse({
+        parsed: share.parsed,
+        platform,
+        sourceUrl: url,
+        resolvedUrl: resolved.finalUrl,
+        extra: { douyinId, redirectChain: resolved.chain, parser: 'douyin-share', diagnostics: [...direct.attempts, ...share.attempts] }
+      });
+    }
+    direct.attempts.push(...share.attempts);
   }
   const browserResult = await parseDouyinWithBrowser({ url: candidateUrl, awemeId: douyinId });
   if (browserResult.ok) {
