@@ -75,6 +75,23 @@ function normalizeMediaUrl(url = '') {
   return String(url).replace(/^http:\/\//i, 'https://');
 }
 
+function preferOfficialSharePlay(url = '', engine = 'douyin-direct') {
+  const normalized = normalizeMediaUrl(url);
+  if (engine !== 'douyin-share' || !normalized) return normalized;
+  try {
+    const parsed = new URL(normalized);
+    if (parsed.protocol !== 'https:' || parsed.hostname !== 'aweme.snssdk.com'
+      || parsed.pathname !== '/aweme/v1/playwm/' || !/^v[0-9A-Za-z]+$/.test(parsed.searchParams.get('video_id') || '')
+      || parsed.username || parsed.password || parsed.port) return normalized;
+    // Share SSR frequently exposes the watermarked playwm wrapper. The
+    // first-party play endpoint returns the same work without that overlay;
+    // retain ratio/line and discard no signed CDN query because this is the
+    // unsigned source wrapper, not the resolved media URL.
+    parsed.pathname = '/aweme/v1/play/';
+    return parsed.toString();
+  } catch { return normalized; }
+}
+
 function extFromMediaUrl(url = '') {
   const match = String(url).match(/\.([a-z0-9]{2,5})(?:[?#]|$)/i);
   return (match?.[1] || 'jpg').toLowerCase() === 'jpeg' ? 'jpg' : (match?.[1] || 'jpg').toLowerCase();
@@ -165,7 +182,7 @@ export function extractAwemeFromJson(json, { engine = 'douyin-direct' } = {}) {
   }
   const video = aweme.video || {};
   const play = video.play_addr || video.play_addr_h264 || video.download_addr || {};
-  const mediaUrl = normalizeMediaUrl(pickUrlList(play, video.bit_rate?.[0]?.play_addr));
+  const mediaUrl = preferOfficialSharePlay(pickUrlList(play, video.bit_rate?.[0]?.play_addr), engine);
   if (!mediaUrl) return null;
   return {
     engine,

@@ -14,7 +14,7 @@ globalThis.fetch = async (url, options = {}) => {
 };
 try {
   const result = await parseDouyin({ url: `https://www.douyin.com/video/${id}`, platform: { id: 'douyin', name: '抖音' } });
-  assert.equal(result.items[0].url, media);
+  assert.equal(result.items[0].url, 'https://media.example/video.mp4?signature=opaque%2Fvalue');
   assert.equal(result.parser, 'douyin-share');
   const shareCall = calls.find(({u}) => u.pathname === `/share/video/${id}/`);
   assert.ok(shareCall);
@@ -45,6 +45,12 @@ assert.equal(extractAwemeFromJson({ aweme_detail: note }).items.length, 1, 'shar
 const musicNote = structuredClone(note);
 musicNote.music.play_url = { url_list: ['https://media.example/preferred.m4a'] };
 assert.equal(extractDouyinShareHtml(noteHtml(musicNote), id).items[1].url, 'https://media.example/preferred.m4a');
+const officialPlay = 'https://aweme.snssdk.com/aweme/v1/playwm/?video_id=v0300fg10000db5171fog65mdo4j37e0&ratio=720p&line=0';
+const officialAweme = { aweme_id: id, desc: 'official wrapper', video: { play_addr: { url_list: [officialPlay] } } };
+const officialParsed = extractDouyinShareHtml(noteHtml(officialAweme), id);
+assert.equal(new URL(officialParsed.items[0].url).pathname, '/aweme/v1/play/');
+assert.equal(new URL(officialParsed.items[0].url).searchParams.get('video_id'), 'v0300fg10000db5171fog65mdo4j37e0');
+
 for (const [uri, wrapper] of [
   [audio, `https://evil.example/aweme/v1/playwm/?video_id=${encodeURIComponent(audio)}`],
   [audio, `https://aweme.snssdk.com/other/?video_id=${encodeURIComponent(audio)}`],
