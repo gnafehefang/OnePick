@@ -550,6 +550,14 @@ app.get('/api/client/versions', (req, res) => {
   res.json({ userscriptVersion: userscriptVersion(), appVersion });
 });
 
+// Only these exact login assets are public; keep the static directory protected.
+app.get(/^\/logo\.png$/, (req, res) => {
+  res.sendFile(path.join(staticDir, 'logo.png'));
+});
+app.get(/^\/favicon\.png$/, (req, res) => {
+  res.sendFile(path.join(staticDir, 'favicon.png'));
+});
+
 app.use(requireAuth);
 
 app.post('/api/auth/token', (req, res) => {
