@@ -75,21 +75,29 @@ function normalizeMediaUrl(url = '') {
   return String(url).replace(/^http:\/\//i, 'https://');
 }
 
-function preferOfficialSharePlay(url = '', engine = 'douyin-direct') {
+function officialSharePlayCandidates(url = '', engine = 'douyin-direct') {
   const normalized = normalizeMediaUrl(url);
-  if (engine !== 'douyin-share' || !normalized) return normalized;
+  if (engine !== 'douyin-share' || !normalized) return [normalized];
   try {
     const parsed = new URL(normalized);
+    const keys = [...parsed.searchParams.keys()];
+    // Only unsigned first-party wrappers have a known line-selection contract.
+    // Signed CDN URLs and unknown/duplicate parameters must remain opaque.
     if (parsed.protocol !== 'https:' || parsed.hostname !== 'aweme.snssdk.com'
-      || parsed.pathname !== '/aweme/v1/playwm/' || !/^v[0-9A-Za-z]+$/.test(parsed.searchParams.get('video_id') || '')
-      || parsed.username || parsed.password || parsed.port) return normalized;
-    // Share SSR frequently exposes the watermarked playwm wrapper. The
-    // first-party play endpoint returns the same work without that overlay;
-    // retain ratio/line and discard no signed CDN query because this is the
-    // unsigned source wrapper, not the resolved media URL.
+      || !['/aweme/v1/playwm/', '/aweme/v1/play/'].includes(parsed.pathname)
+      || !/^v[0-9A-Za-z]+$/.test(parsed.searchParams.get('video_id') || '')
+      || parsed.username || parsed.password || parsed.port || parsed.hash
+      || keys.some(key => !['video_id', 'ratio', 'line', 'logo_name'].includes(key))
+      || new Set(keys).size !== keys.length
+      || !['0', '1'].includes(parsed.searchParams.get('line') ?? '0')) return [normalized];
     parsed.pathname = '/aweme/v1/play/';
-    return parsed.toString();
-  } catch { return normalized; }
+    const primary = parsed.toString();
+    // line=0 can resolve to a broken cold CDN while line=1 still serves the
+    // same video. Keep both: the download boundary validates every redirect
+    // and tries the alternate only before sending media to the client.
+    parsed.searchParams.set('line', parsed.searchParams.get('line') === '1' ? '0' : '1');
+    return [primary, parsed.toString()];
+  } catch { return [normalized]; }
 }
 
 function extFromMediaUrl(url = '') {
@@ -182,7 +190,9 @@ export function extractAwemeFromJson(json, { engine = 'douyin-direct' } = {}) {
   }
   const video = aweme.video || {};
   const play = video.play_addr || video.play_addr_h264 || video.download_addr || {};
-  const mediaUrl = preferOfficialSharePlay(pickUrlList(play, video.bit_rate?.[0]?.play_addr), engine);
+  const mediaUrls = [...new Set(pickUrlCandidates(play, video.bit_rate?.[0]?.play_addr)
+    .flatMap(url => officialSharePlayCandidates(url, engine)))].slice(0, 5);
+  const mediaUrl = mediaUrls[0];
   if (!mediaUrl) return null;
   return {
     engine,
@@ -194,6 +204,7 @@ export function extractAwemeFromJson(json, { engine = 'douyin-direct' } = {}) {
     items: [{
       type: 'video',
       url: mediaUrl,
+      urlCandidates: mediaUrls,
       filename: safeFilename(title, 'mp4'),
       ext: 'mp4',
       formatId: engine,
